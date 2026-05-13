@@ -1,0 +1,43 @@
+{
+  "schema_name": "TRACE Behavior Stack Schema",
+  "version": "v1",
+  "description": "Defines how TRACE layers behaviors together.",
+  "layers": {
+    "scene": {
+      "description": "Environmental conditions and lighting behavior.",
+      "allowed_primitives": [
+        "environmental_ambiguity",
+        "physical_falloff",
+        "foreground_pressure",
+        "memory_anchor"
+      ]
+    },
+    "camera": {
+      "description": "How TRACE interprets and preserves the scene.",
+      "allowed_primitives": [
+        "darkness_confidence",
+        "shadow_texture",
+        "motion_softness"
+      ]
+    },
+    "circulation": {
+      "description": "How digital movement changes the image over time.",
+      "allowed_primitives": [
+        "circulation_residue"
+      ]
+    },
+    "roll": {
+      "description": "How a sequence of images behaves together.",
+      "allowed_primitives": [
+        "roll_drift"
+      ]
+    }
+  },
+  "evaluation_targets": [
+    "atmosphere",
+    "believability",
+    "shadow_texture",
+    "phone_avoidance",
+    "memory_pressure"
+  ]
+}
