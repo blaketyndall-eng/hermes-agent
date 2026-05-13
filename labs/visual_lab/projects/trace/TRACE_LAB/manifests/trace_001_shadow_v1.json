@@ -1,0 +1,72 @@
+{
+  "experiment_id": "TRACE_001_SHADOW",
+  "version": "v1",
+  "title": "Experiment 001: Shadow",
+  "purpose": "Test how different shadow treatments affect atmosphere, believability, shadow texture, phone avoidance, and memory pressure.",
+  "dataset": {
+    "name": "phone_input_v1",
+    "input_path": "data/input/phone",
+    "notes": "Casual phone images. Originals should remain untouched."
+  },
+  "output": {
+    "base_path": "data/output/exp_001_shadow",
+    "contact_sheet_path": "data/output/exp_001_shadow/contact_sheets",
+    "log_path": "data/output/exp_001_shadow/exp_001_shadow_log.csv"
+  },
+  "profiles": {
+    "original": {
+      "description": "Unchanged baseline copy.",
+      "shadow_strength": 0.0,
+      "contrast_level": 1.0,
+      "noise_level": 0.0
+    },
+    "phone_flat": {
+      "description": "Slightly lifted shadows, cleaner and more phone-like.",
+      "lift_amount": 0.14,
+      "shadow_strength": 0.14,
+      "contrast_level": 0.96,
+      "noise_level": 0.0
+    },
+    "crush": {
+      "description": "Deeper blacks and stronger contrast stress test.",
+      "crush_strength": 0.24,
+      "contrast_boost": 1.10,
+      "shadow_strength": 0.24,
+      "contrast_level": 1.10,
+      "noise_level": 0.0
+    },
+    "texture": {
+      "description": "Deeper shadows plus subtle shadow-biased texture.",
+      "crush_strength": 0.24,
+      "contrast_boost": 1.10,
+      "shadow_threshold": 115,
+      "noise_level": 0.03,
+      "shadow_strength": 0.24,
+      "contrast_level": 1.10
+    },
+    "trace_candidate": {
+      "description": "Balanced TRACE-style shadow preservation.",
+      "crush_strength": 0.12,
+      "contrast_boost": 1.03,
+      "shadow_threshold": 100,
+      "noise_level": 0.015,
+      "shadow_strength": 0.12,
+      "contrast_level": 1.03
+    }
+  },
+  "rubric": [
+    "Atmosphere",
+    "Believability",
+    "Shadow Texture",
+    "Phone Avoidance",
+    "Memory Pressure"
+  ],
+  "anti_goals": [
+    "No fake film borders",
+    "No scratches",
+    "No sprockets",
+    "No VHS overlays",
+    "No overdone grain",
+    "No obvious preset behavior"
+  ]
+}
