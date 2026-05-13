@@ -1,0 +1,32 @@
+{
+  "profile_id": "parking_lot_flash_v1",
+  "description": "Harsh nighttime flash environment with foreground dominance and black background collapse.",
+  "scene": {
+    "environmental_ambiguity": 0.48,
+    "physical_falloff": 0.40,
+    "foreground_pressure": 0.82,
+    "memory_anchor": 0.78
+  },
+  "camera": {
+    "darkness_confidence": 0.74,
+    "shadow_texture": 0.18,
+    "motion_softness": 0.10
+  },
+  "circulation": {
+    "circulation_residue": 0.10
+  },
+  "roll": {
+    "roll_drift": 0.22
+  },
+  "target_behaviors": [
+    "foreground_dominance",
+    "background_collapse",
+    "memory_pressure_high",
+    "anti_phone_success"
+  ],
+  "anti_goals": [
+    "fake_flash_glow",
+    "HDR_lifted_backgrounds",
+    "stylized_contrast"
+  ]
+}
