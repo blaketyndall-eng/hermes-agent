@@ -1,0 +1,32 @@
+{
+  "drift_profile_id": "subtle_night_drift_v1",
+  "description": "Restrained nighttime sequence drift with slight exposure and texture movement.",
+  "target_use_cases": [
+    "night_walk",
+    "parking_lot",
+    "late_bar"
+  ],
+  "drift_rules": {
+    "darkness_confidence": {
+      "min_offset": -0.02,
+      "max_offset": 0.03,
+      "curve": "slow_wave"
+    },
+    "shadow_texture": {
+      "min_offset": -0.01,
+      "max_offset": 0.015,
+      "curve": "soft_noise"
+    },
+    "motion_softness": {
+      "min_offset": 0.0,
+      "max_offset": 0.02,
+      "curve": "late_rise"
+    }
+  },
+  "anti_goals": [
+    "random instability",
+    "obvious parameter swings",
+    "preset repetition",
+    "dramatic tonal inconsistency"
+  ]
+}
