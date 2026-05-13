@@ -1,0 +1,36 @@
+{
+  "roll_id": "late_walk_roll_v1",
+  "version": "v1",
+  "profile": "night_walk_v1",
+  "environment": "late sidewalk walk",
+  "description": "A coherent nighttime walking sequence focused on darkness confidence, restrained instability, and memory pressure.",
+  "target_image_count": 24,
+  "target_behaviors": [
+    "deep_shadow",
+    "dimensional_black",
+    "slight_motion_softness",
+    "restrained_instability",
+    "memory_pressure_high",
+    "anti_phone_success"
+  ],
+  "sequence_goals": [
+    "Images should feel emotionally connected without becoming visually repetitive.",
+    "Darkness should behave coherently across the roll.",
+    "Small drift should feel natural, not random.",
+    "The sequence should feel like one lived period of time."
+  ],
+  "anti_goals": [
+    "uniform preset repetition",
+    "random inconsistency",
+    "overdone grain",
+    "fake nostalgia",
+    "phone HDR flatness"
+  ],
+  "evaluation_axes": [
+    "sequence_coherence",
+    "emotional_continuity",
+    "controlled_drift",
+    "environment_persistence",
+    "roll_memory_pressure"
+  ]
+}
