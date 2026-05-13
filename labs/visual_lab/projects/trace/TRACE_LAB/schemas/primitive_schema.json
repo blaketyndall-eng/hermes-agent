@@ -1,0 +1,23 @@
+{
+  "schema_name": "TRACE Primitive Schema",
+  "version": "v1",
+  "description": "Machine-readable schema for TRACE behavioral primitives.",
+  "primitive_fields": {
+    "id": "Unique primitive identifier, e.g. darkness_confidence",
+    "label": "Human-readable label",
+    "layer": "scene | camera | circulation | roll | evaluation",
+    "definition": "Plain-language definition",
+    "low_behavior": "What low intensity produces",
+    "high_behavior": "What high intensity produces",
+    "failure_modes": ["Known ways this primitive can break believability"],
+    "related_tags": ["Behavior taxonomy tags connected to this primitive"],
+    "default_intensity": "0.0 to 1.0 suggested starting point"
+  },
+  "intensity_scale": {
+    "0.0": "absent",
+    "0.25": "subtle",
+    "0.5": "moderate",
+    "0.75": "strong",
+    "1.0": "extreme / likely failure risk"
+  }
+}
