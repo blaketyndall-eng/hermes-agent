@@ -1,0 +1,66 @@
+# Pre-commit hooks for Hermes Agent
+# Install with: pre-commit install
+# Run all hooks: pre-commit run --all-files
+
+repos:
+  # Code formatting & style
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # Type checking
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.8.0
+    hooks:
+      - id: mypy
+        args: [--ignore-missing-imports, --no-incremental]
+        exclude: ^(tests/|tools/|gateway/|plugins/)
+
+  # Trailing whitespace & end-of-file fixers
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(tests/fixtures/|docs/)
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: debug-statements
+      - id: mixed-line-ending
+
+  # Import sorting (isort)
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: [--profile=black, --line-length=100]
+
+# Global settings
+exclude: |
+  (?x)^(
+      \.git/
+      | \.venv/
+      | venv/
+      | node_modules/
+      | __pycache__/
+      | \.mypy_cache/
+      | \.pytest_cache/
+      | \.tox/
+      | build/
+      | dist/
+      | \.egg-info/
+      | uv.lock
+      | package-lock.json
+  )
+
+ci:
+  autofix_commit_msg: 'style: auto-format via pre-commit'
+  autofix_prs: true
+  autoupdate_commit_msg: 'chore: update pre-commit hooks'
+  autoupdate_schedule: monthly
+  skip: []
+  submodules: false
