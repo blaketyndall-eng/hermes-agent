@@ -1,0 +1,22 @@
+{
+  "environment_id": "convenience_store_v1",
+  "description": "Cold fluorescent convenience store environment with reflective surfaces and emotionally flat visibility.",
+  "environment_biases": {
+    "environmental_ambiguity": -0.08,
+    "darkness_confidence": -0.04,
+    "shadow_texture": -0.02,
+    "foreground_pressure": 0.03,
+    "memory_anchor": 0.06
+  },
+  "target_behaviors": [
+    "fluorescent_harshness",
+    "reflective_packaging",
+    "cold_visibility",
+    "environmental_emptiness"
+  ],
+  "anti_goals": [
+    "warm_cinematic_glow",
+    "heavy_texture",
+    "overdone_darkness"
+  ]
+}
