@@ -8,6 +8,9 @@ Study how different shadow treatments affect:
 
 Optional profile usage:
     python experiments/exp_001_shadow.py --profile profiles/night_walk_profile.json
+
+Run mode:
+    By default, outputs are written to a timestamped run folder under runs/.
 """
 
 import argparse
@@ -20,6 +23,7 @@ from src.export import (
 )
 from src.ingest import load_image
 from src.profiles import load_profile, shadow_params_from_profile
+from src.run_manager import create_run_directory, write_run_summary
 from src.shadow import (
     apply_shadow_crush,
     apply_shadow_lift,
@@ -30,9 +34,10 @@ from src.utils import ensure_dir, list_image_files, safe_stem
 
 ROOT = Path(__file__).resolve().parents[1]
 INPUT_DIR = ROOT / "data" / "input" / "phone"
-OUTPUT_DIR = ROOT / "data" / "output" / "exp_001_shadow"
-CONTACT_DIR = OUTPUT_DIR / "contact_sheets"
-LOG_PATH = OUTPUT_DIR / "exp_001_shadow_log.csv"
+LEGACY_OUTPUT_DIR = ROOT / "data" / "output" / "exp_001_shadow"
+RUNS_ROOT = ROOT / "runs"
+EXPERIMENT_ID = "TRACE_001_SHADOW"
+EXPERIMENT_TITLE = "Experiment 001: Shadow"
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +48,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional path to a TRACE behavior profile JSON file.",
+    )
+    parser.add_argument(
+        "--legacy-output",
+        action="store_true",
+        help="Write to data/output/exp_001_shadow instead of a timestamped run folder.",
     )
     return parser.parse_args()
 
@@ -66,12 +76,32 @@ def resolve_profile(profile_path: str | None):
     return profile, params
 
 
+def resolve_output_paths(args: argparse.Namespace, profile) -> tuple[Path, Path, Path, Path | None]:
+    """Return output, contact, log, and optional run directory paths."""
+    if args.legacy_output:
+        output_dir = LEGACY_OUTPUT_DIR
+        contact_dir = output_dir / "contact_sheets"
+        log_path = output_dir / "exp_001_shadow_log.csv"
+        ensure_dir(output_dir)
+        ensure_dir(contact_dir)
+        return output_dir, contact_dir, log_path, None
+
+    profile_suffix = profile.get("profile_id", "default") if profile else "default"
+    run_dir = create_run_directory(
+        RUNS_ROOT,
+        experiment_id=f"{EXPERIMENT_ID.lower()}_{profile_suffix}",
+        version="v1",
+    )
+    output_dir = run_dir / "outputs"
+    contact_dir = run_dir / "contact_sheets"
+    log_path = run_dir / "logs" / "exp_001_shadow_log.csv"
+    return output_dir, contact_dir, log_path, run_dir
+
+
 def main() -> None:
     args = parse_args()
     profile, trace_params = resolve_profile(args.profile)
-
-    ensure_dir(OUTPUT_DIR)
-    ensure_dir(CONTACT_DIR)
+    output_dir, contact_dir, log_path, run_dir = resolve_output_paths(args, profile)
 
     image_paths = list_image_files(INPUT_DIR)
 
@@ -121,11 +151,11 @@ def main() -> None:
         else:
             versions["trace_candidate"] = apply_trace_shadow_profile(image)
 
-        export_versions(versions, OUTPUT_DIR, stem)
+        export_versions(versions, output_dir, stem)
 
         create_contact_sheet(
             versions,
-            CONTACT_DIR / f"{stem}_contact_sheet.jpg",
+            contact_dir / f"{stem}_contact_sheet.jpg",
         )
 
         metadata = {
@@ -155,10 +185,20 @@ def main() -> None:
                 }
             )
 
-    write_experiment_log(log_rows, LOG_PATH)
+    write_experiment_log(log_rows, log_path)
+
+    if run_dir:
+        write_run_summary(
+            run_dir=run_dir,
+            experiment_id=EXPERIMENT_ID,
+            title=EXPERIMENT_TITLE,
+            image_count=len(image_paths),
+        )
 
     print("Experiment complete.")
-    print(f"Outputs saved to: {OUTPUT_DIR}")
+    print(f"Outputs saved to: {output_dir}")
+    if run_dir:
+        print(f"Run folder: {run_dir}")
 
 
 if __name__ == "__main__":
