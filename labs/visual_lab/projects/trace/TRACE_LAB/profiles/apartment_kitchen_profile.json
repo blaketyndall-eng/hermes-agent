@@ -1,0 +1,32 @@
+{
+  "profile_id": "apartment_kitchen_v1",
+  "description": "Warm apartment kitchen environment with soft falloff, muddy corners, and restrained low-light instability.",
+  "scene": {
+    "environmental_ambiguity": 0.52,
+    "physical_falloff": 0.68,
+    "foreground_pressure": 0.35,
+    "memory_anchor": 0.50
+  },
+  "camera": {
+    "darkness_confidence": 0.60,
+    "shadow_texture": 0.26,
+    "motion_softness": 0.14
+  },
+  "circulation": {
+    "circulation_residue": 0.08
+  },
+  "roll": {
+    "roll_drift": 0.16
+  },
+  "target_behaviors": [
+    "physical_falloff",
+    "dimensional_black",
+    "remembered_not_documented",
+    "surface_physicality"
+  ],
+  "anti_goals": [
+    "clinical_sharpness",
+    "flat_visibility",
+    "heavy_noise"
+  ]
+}
