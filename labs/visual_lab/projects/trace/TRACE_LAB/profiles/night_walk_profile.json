@@ -1,0 +1,34 @@
+{
+  "profile_id": "night_walk_v1",
+  "description": "Low-light nighttime walking environment with restrained instability and preserved darkness.",
+  "scene": {
+    "environmental_ambiguity": 0.65,
+    "physical_falloff": 0.55,
+    "foreground_pressure": 0.45,
+    "memory_anchor": 0.60
+  },
+  "camera": {
+    "darkness_confidence": 0.72,
+    "shadow_texture": 0.38,
+    "motion_softness": 0.28
+  },
+  "circulation": {
+    "circulation_residue": 0.12
+  },
+  "roll": {
+    "roll_drift": 0.20
+  },
+  "target_behaviors": [
+    "deep_shadow",
+    "dimensional_black",
+    "slight_motion_softness",
+    "memory_pressure_high",
+    "anti_phone_success"
+  ],
+  "anti_goals": [
+    "obvious grain",
+    "fake vignette",
+    "aggressive HDR",
+    "stylized blur"
+  ]
+}
