@@ -413,9 +413,22 @@ def _get_async_parallel_client():
 
 _TAVILY_BASE_URL = os.getenv("TAVILY_BASE_URL", "https://api.tavily.com")
 
+# Module-level AsyncClient; lazy-created on first use so we don't open a
+# connection pool at import time.  Reused across calls to avoid per-request
+# connect overhead.
+_TAVILY_CLIENT: Optional[httpx.AsyncClient] = None
 
-def _tavily_request(endpoint: str, payload: dict) -> dict:
-    """Send a POST request to the Tavily API.
+
+def _get_tavily_client() -> httpx.AsyncClient:
+    """Return (and lazily create) the module-level AsyncClient."""
+    global _TAVILY_CLIENT
+    if _TAVILY_CLIENT is None:
+        _TAVILY_CLIENT = httpx.AsyncClient(timeout=60)
+    return _TAVILY_CLIENT
+
+
+async def _tavily_request(endpoint: str, payload: dict) -> dict:
+    """Send a POST request to the Tavily API (async).
 
     Auth is provided via ``api_key`` in the JSON body (no header-based auth).
     Raises ``ValueError`` if ``TAVILY_API_KEY`` is not set.
@@ -431,9 +444,20 @@ def _tavily_request(endpoint: str, payload: dict) -> dict:
     logger.info("Tavily %s request to %s", endpoint, url)
     # Tavily /crawl requires Bearer auth in header (body-only auth returns 401)
     headers = {"Authorization": f"Bearer {api_key}"} if endpoint.strip("/") == "crawl" else {}
-    response = httpx.post(url, json=payload, headers=headers, timeout=60)
+    client = _get_tavily_client()
+    response = await client.post(url, json=payload, headers=headers)
     response.raise_for_status()
     return response.json()
+
+
+def _tavily_request_sync(endpoint: str, payload: dict) -> dict:
+    """Synchronous shim around ``_tavily_request`` for use in plain ``def`` callers.
+
+    Uses ``asyncio.run`` which starts a fresh event loop, so this must NOT be
+    called from within a running event loop (i.e. from ``async def`` code).
+    Async callers should ``await _tavily_request(...)`` directly.
+    """
+    return asyncio.run(_tavily_request(endpoint, payload))
 
 
 def _normalize_tavily_search_results(response: dict) -> dict:
@@ -1284,7 +1308,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         if backend == "tavily":
             logger.info("Tavily search: '%s' (limit: %d)", query, limit)
-            raw = _tavily_request("search", {
+            raw = _tavily_request_sync("search", {
                 "query": query,
                 "max_results": min(limit, 20),
                 "include_raw_content": False,
@@ -1427,7 +1451,7 @@ async def web_extract_tool(
                 results = _exa_extract(safe_urls)
             elif backend == "tavily":
                 logger.info("Tavily extract: %d URL(s)", len(safe_urls))
-                raw = _tavily_request("extract", {
+                raw = await _tavily_request("extract", {
                     "urls": safe_urls,
                     "include_images": False,
                 })
@@ -1761,7 +1785,7 @@ async def web_crawl_tool(
             }
             if instructions:
                 payload["instructions"] = instructions
-            raw = _tavily_request("crawl", payload)
+            raw = await _tavily_request("crawl", payload)
             results = _normalize_tavily_documents(raw, fallback_url=url)
 
             response = {"results": results}
