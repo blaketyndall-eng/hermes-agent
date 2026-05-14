@@ -606,6 +606,8 @@ def _get_default_summarizer_model() -> Optional[str]:
 
 _debug = DebugSession("web_tools", env_var="WEB_TOOLS_DEBUG")
 
+_CHUNK_LLM_SEMAPHORE = asyncio.Semaphore(int(os.getenv("HERMES_WEB_CHUNK_LLM_CONCURRENCY", "3")))
+
 
 async def process_content_with_llm(
     content: str, 
@@ -854,26 +856,27 @@ async def _process_large_content_chunked(
     
     logger.info("Split into %d chunks of ~%d chars each", len(chunks), chunk_size)
     
-    # Summarize each chunk in parallel
+    # Summarize each chunk in parallel (bounded by _CHUNK_LLM_SEMAPHORE)
     async def summarize_chunk(chunk_idx: int, chunk_content: str) -> tuple[int, Optional[str]]:
         """Summarize a single chunk."""
         try:
             chunk_info = f"[Processing chunk {chunk_idx + 1} of {len(chunks)}]"
-            summary = await _call_summarizer_llm(
-                chunk_content, 
-                context_str, 
-                model, 
-                max_tokens=10000,
-                is_chunk=True,
-                chunk_info=chunk_info
-            )
+            async with _CHUNK_LLM_SEMAPHORE:
+                summary = await _call_summarizer_llm(
+                    chunk_content,
+                    context_str,
+                    model,
+                    max_tokens=4000,
+                    is_chunk=True,
+                    chunk_info=chunk_info
+                )
             if summary:
                 logger.info("Chunk %d/%d summarized: %d -> %d chars", chunk_idx + 1, len(chunks), len(chunk_content), len(summary))
             return chunk_idx, summary
         except Exception as e:
             logger.warning("Chunk %d/%d failed: %s", chunk_idx + 1, len(chunks), str(e)[:50])
             return chunk_idx, None
-    
+
     # Run all chunk summarizations in parallel
     tasks = [summarize_chunk(i, chunk) for i, chunk in enumerate(chunks)]
     results = await asyncio.gather(*tasks)

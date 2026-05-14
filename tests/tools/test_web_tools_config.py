@@ -625,3 +625,55 @@ def test_web_requires_env_includes_exa_key():
     from tools.web_tools import _web_requires_env
 
     assert "EXA_API_KEY" in _web_requires_env()
+
+
+class TestChunkLLMSemaphore:
+    """Verify _CHUNK_LLM_SEMAPHORE caps concurrent chunk-summarization calls."""
+
+    def test_semaphore_default_value(self):
+        import tools.web_tools
+        assert tools.web_tools._CHUNK_LLM_SEMAPHORE._value == 3
+
+    def test_semaphore_env_override(self, monkeypatch):
+        import importlib
+        import tools.web_tools
+        monkeypatch.setenv("HERMES_WEB_CHUNK_LLM_CONCURRENCY", "5")
+        importlib.reload(tools.web_tools)
+        assert tools.web_tools._CHUNK_LLM_SEMAPHORE._value == 5
+        monkeypatch.delenv("HERMES_WEB_CHUNK_LLM_CONCURRENCY", raising=False)
+        importlib.reload(tools.web_tools)
+
+    def test_semaphore_caps_concurrency(self):
+        """Confirm at most 3 chunk summarizer calls run concurrently."""
+        import asyncio
+        from unittest.mock import patch
+        import tools.web_tools
+
+        max_concurrent = 0
+        current_concurrent = 0
+        call_count = 0
+
+        async def fake_summarizer(chunk, context_str, model, max_tokens, is_chunk, chunk_info):
+            nonlocal max_concurrent, current_concurrent, call_count
+            current_concurrent += 1
+            call_count += 1
+            if current_concurrent > max_concurrent:
+                max_concurrent = current_concurrent
+            await asyncio.sleep(0)
+            current_concurrent -= 1
+            return f"summary-{call_count}"
+
+        async def run():
+            with patch("tools.web_tools._call_summarizer_llm", side_effect=fake_summarizer):
+                large_content = "x" * (100_000 * 7)
+                await tools.web_tools._process_large_content_chunked(
+                    large_content,
+                    context_str="test",
+                    model=None,
+                    chunk_size=100_000,
+                    max_output_size=500_000,
+                )
+            return max_concurrent
+
+        observed = asyncio.run(run())
+        assert observed <= 3
