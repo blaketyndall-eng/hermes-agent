@@ -19,6 +19,7 @@ References:
   Gayler (2004) — Vector Symbolic Architectures answer Jackendoff's challenges
 """
 
+import functools
 import hashlib
 import logging
 import struct
@@ -40,6 +41,7 @@ def _require_numpy() -> None:
         raise RuntimeError("numpy is required for holographic operations")
 
 
+@functools.lru_cache(maxsize=4096)
 def encode_atom(word: str, dim: int = 1024) -> "np.ndarray":
     """Deterministic phase vector via SHA-256 counter blocks.
 
