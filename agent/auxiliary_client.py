@@ -3642,11 +3642,7 @@ def _refresh_nous_auxiliary_client(
 
     current_loop = None
     if async_mode:
-        try:
-            import asyncio as _aio
-            current_loop = _aio.get_event_loop()
-        except RuntimeError:
-            pass
+        current_loop = asyncio.get_running_loop()
         client, final_model = _to_async_client(sync_client, final_model or "", is_vision=is_vision)
     else:
         client = sync_client
@@ -3819,11 +3815,7 @@ def _get_cached_client(
     # (which causes deadlocks, see #2681).
     current_loop = None
     if async_mode:
-        try:
-            import asyncio as _aio
-            current_loop = _aio.get_event_loop()
-        except RuntimeError:
-            pass
+        current_loop = asyncio.get_running_loop()
     runtime = _normalize_main_runtime(main_runtime)
     cache_key = _client_cache_key(
         provider,

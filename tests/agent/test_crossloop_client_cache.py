@@ -1,8 +1,12 @@
-"""Tests for cross-loop client cache isolation fix (#2681).
+"""Tests for cross-loop client cache isolation fix (#2681) and W2-T19.
 
 Verifies that _get_cached_client() returns different AsyncOpenAI clients
 when called from different event loops, preventing the httpx deadlock
 that occurs when a cached async client bound to loop A is reused on loop B.
+
+Also verifies that get_running_loop() is used (not the deprecated
+get_event_loop()) so loop mismatches surface as RuntimeError rather than
+silent cache poisoning.
 
 This test file is self-contained and does not import the full tool chain,
 so it can run without optional dependencies like firecrawl.
@@ -10,9 +14,7 @@ so it can run without optional dependencies like firecrawl.
 
 import asyncio
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch, MagicMock
-from types import SimpleNamespace
 
 import pytest
 
@@ -32,11 +34,6 @@ def _stub_resolve_provider_client(provider, model, async_mode, **kw):
 @pytest.fixture(autouse=True)
 def _clean_client_cache():
     """Clear the client cache before each test."""
-    import importlib
-    # We need to patch before importing
-    with patch.dict("sys.modules", {}):
-        pass
-    # Import and clear
     import agent.auxiliary_client as ac
     ac._client_cache.clear()
     yield
@@ -48,22 +45,25 @@ class TestCrossLoopCacheIsolation:
 
     def test_same_loop_reuses_client(self):
         """Within a single event loop, the same client should be returned."""
-        from agent.auxiliary_client import _get_cached_client, _client_cache
+        from agent.auxiliary_client import _get_cached_client
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        results = {}
 
-        with patch("agent.auxiliary_client.resolve_provider_client",
-                    side_effect=_stub_resolve_provider_client):
-            client1, _ = _get_cached_client("custom", "m1", async_mode=True,
-                                             base_url="http://localhost:8081/v1")
-            client2, _ = _get_cached_client("custom", "m1", async_mode=True,
-                                             base_url="http://localhost:8081/v1")
+        async def _run():
+            with patch("agent.auxiliary_client.resolve_provider_client",
+                        side_effect=_stub_resolve_provider_client):
+                c1, _ = _get_cached_client("custom", "m1", async_mode=True,
+                                            base_url="http://localhost:8081/v1")
+                c2, _ = _get_cached_client("custom", "m1", async_mode=True,
+                                            base_url="http://localhost:8081/v1")
+            results["c1"] = c1
+            results["c2"] = c2
 
-        assert client1 is client2, (
+        asyncio.run(_run())
+
+        assert results["c1"] is results["c2"], (
             "Same loop should return the same cached client"
         )
-        loop.close()
 
     def test_different_loops_get_different_clients(self):
         """Different event loops must get separate client instances."""
@@ -72,25 +72,21 @@ class TestCrossLoopCacheIsolation:
         results = {}
 
         def _get_client_on_new_loop(name):
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            with patch("agent.auxiliary_client.resolve_provider_client",
-                        side_effect=_stub_resolve_provider_client):
-                client, _ = _get_cached_client("custom", "m1", async_mode=True,
-                                                 base_url="http://localhost:8081/v1")
-            results[name] = (id(client), id(loop))
-            # Don't close loop — simulates real usage where loops persist
+            async def _inner():
+                with patch("agent.auxiliary_client.resolve_provider_client",
+                            side_effect=_stub_resolve_provider_client):
+                    client, _ = _get_cached_client("custom", "m1", async_mode=True,
+                                                     base_url="http://localhost:8081/v1")
+                results[name] = id(client)
+
+            asyncio.run(_inner())
 
         t1 = threading.Thread(target=_get_client_on_new_loop, args=("a",))
         t2 = threading.Thread(target=_get_client_on_new_loop, args=("b",))
         t1.start(); t1.join()
         t2.start(); t2.join()
 
-        client_id_a, loop_id_a = results["a"]
-        client_id_b, loop_id_b = results["b"]
-
-        assert loop_id_a != loop_id_b, "Test setup error: same loop on both threads"
-        assert client_id_a != client_id_b, (
+        assert results["a"] != results["b"], (
             "Different event loops got the SAME cached client — this causes "
             "httpx cross-loop deadlocks in gateway mode (#2681)"
         )
@@ -103,8 +99,6 @@ class TestCrossLoopCacheIsolation:
         results = {}
 
         def _get_sync_client(name):
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
             with patch("agent.auxiliary_client.resolve_provider_client",
                         side_effect=_stub_resolve_provider_client):
                 client, _ = _get_cached_client("custom", "m1", async_mode=False,
@@ -126,17 +120,20 @@ class TestCrossLoopCacheIsolation:
         not reused from a different one."""
         from agent.auxiliary_client import _get_cached_client
 
-        # Simulate: first call on "gateway loop"
-        gateway_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(gateway_loop)
+        gateway_client_id = [None]
+        worker_client_id = [None]
 
-        with patch("agent.auxiliary_client.resolve_provider_client",
-                    side_effect=_stub_resolve_provider_client):
-            gateway_client, _ = _get_cached_client("custom", "m1", async_mode=True,
-                                                     base_url="http://localhost:8081/v1")
+        # Simulate: first call on "gateway loop"
+        async def _gateway():
+            with patch("agent.auxiliary_client.resolve_provider_client",
+                        side_effect=_stub_resolve_provider_client):
+                client, _ = _get_cached_client("custom", "m1", async_mode=True,
+                                                 base_url="http://localhost:8081/v1")
+            gateway_client_id[0] = id(client)
+
+        asyncio.run(_gateway())
 
         # Simulate: _run_async spawns a thread with asyncio.run()
-        worker_client_id = [None]
         def _worker():
             async def _inner():
                 with patch("agent.auxiliary_client.resolve_provider_client",
@@ -150,37 +147,86 @@ class TestCrossLoopCacheIsolation:
         t.start()
         t.join()
 
-        assert worker_client_id[0] != id(gateway_client), (
+        assert worker_client_id[0] != gateway_client_id[0], (
             "Worker thread (asyncio.run) got the gateway's cached client — "
             "this is the exact cross-loop scenario that causes httpx deadlocks. "
-            "The cache key must include the event loop identity (#2681)"
+            "The cache must isolate clients by running loop (#2681)"
         )
-        gateway_loop.close()
 
     def test_closed_loop_client_discarded(self):
         """A cached client whose loop has closed should be replaced."""
         from agent.auxiliary_client import _get_cached_client
 
-        loop1 = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop1)
+        client_ids = []
 
-        with patch("agent.auxiliary_client.resolve_provider_client",
-                    side_effect=_stub_resolve_provider_client):
-            client1, _ = _get_cached_client("custom", "m1", async_mode=True,
-                                             base_url="http://localhost:8081/v1")
+        def _run_on_new_loop():
+            async def _inner():
+                with patch("agent.auxiliary_client.resolve_provider_client",
+                            side_effect=_stub_resolve_provider_client):
+                    client, _ = _get_cached_client("custom", "m1", async_mode=True,
+                                                     base_url="http://localhost:8081/v1")
+                client_ids.append(id(client))
 
-        loop1.close()
+            # asyncio.run() creates a new loop, runs it, then closes it.
+            # The second call creates a fresh loop — simulating the
+            # closed-loop replacement scenario.
+            asyncio.run(_inner())
 
-        # New loop on same thread
-        loop2 = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop2)
+        _run_on_new_loop()  # loop A (created and closed by asyncio.run)
+        _run_on_new_loop()  # loop B (new loop — cached_loop.is_closed() on A)
 
-        with patch("agent.auxiliary_client.resolve_provider_client",
-                    side_effect=_stub_resolve_provider_client):
-            client2, _ = _get_cached_client("custom", "m1", async_mode=True,
-                                             base_url="http://localhost:8081/v1")
-
-        assert client1 is not client2, (
+        assert client_ids[0] != client_ids[1], (
             "Client from closed loop should not be reused"
         )
-        loop2.close()
+
+
+# ---------------------------------------------------------------------------
+# W2-T19: get_running_loop tests
+# ---------------------------------------------------------------------------
+
+class TestGetRunningLoopUsage:
+    """Verify W2-T19: get_running_loop() replaces deprecated get_event_loop()."""
+
+    def test_async_client_cache_uses_running_loop(self):
+        """In an async context, two calls with same params reuse the cached client.
+
+        With get_running_loop() both calls see the SAME running loop, so the
+        cache hit succeeds. This was broken with get_event_loop() because that
+        could return different (or closed) loop objects on each call.
+        """
+        from agent.auxiliary_client import _get_cached_client
+
+        results = {}
+
+        async def _run():
+            with patch("agent.auxiliary_client.resolve_provider_client",
+                        side_effect=_stub_resolve_provider_client):
+                c1, _ = _get_cached_client("openai", "gpt-4o", async_mode=True,
+                                            base_url="https://api.openai.com/v1")
+                c2, _ = _get_cached_client("openai", "gpt-4o", async_mode=True,
+                                            base_url="https://api.openai.com/v1")
+            results["c1"] = c1
+            results["c2"] = c2
+
+        asyncio.run(_run())
+
+        assert results["c1"] is results["c2"], (
+            "Cache should reuse client when both calls share the same running loop. "
+            "If this fails, get_running_loop() is returning different loop objects, "
+            "indicating the deprecated get_event_loop() regression is back."
+        )
+
+    def test_get_running_loop_raises_outside_coroutine(self):
+        """Calling _get_cached_client(async_mode=True) from sync context raises RuntimeError.
+
+        This is the correct behavior: async_mode=True means the caller asserts
+        it is in a coroutine. Surfacing the error is better than silently
+        obtaining a wrong/closed loop via the deprecated get_event_loop().
+        """
+        from agent.auxiliary_client import _get_cached_client
+
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            with patch("agent.auxiliary_client.resolve_provider_client",
+                        side_effect=_stub_resolve_provider_client):
+                _get_cached_client("openai", "gpt-4o", async_mode=True,
+                                   base_url="https://api.openai.com/v1")
