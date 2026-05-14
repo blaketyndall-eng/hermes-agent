@@ -3351,8 +3351,7 @@ class TestSenderNameResolution(unittest.TestCase):
 
         adapter = FeishuAdapter(PlatformConfig())
         adapter._client = SimpleNamespace()
-        future_expire = time.time() + 600
-        adapter._sender_name_cache["ou_cached"] = ("Alice", future_expire)
+        adapter._sender_name_cache["ou_cached"] = "Alice"
         result = asyncio.run(adapter._resolve_sender_name_from_api("ou_cached"))
         self.assertEqual(result, "Alice")
 
@@ -3391,8 +3390,18 @@ class TestSenderNameResolution(unittest.TestCase):
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        # Expired cache entry.
-        adapter._sender_name_cache["ou_expired"] = ("OldName", time.time() - 1)
+        # Insert entry as if it was stored far in the past so TTL has elapsed.
+        base = 1_000_000.0
+        with patch("gateway.platforms.feishu.time") as mock_time:
+            mock_time.monotonic.return_value = base
+            mock_time.time.return_value = base
+            adapter._sender_name_cache["ou_expired"] = "OldName"
+        # Now at base + TTL + 1: entry is expired
+        with patch("gateway.platforms.feishu.time") as mock_time:
+            mock_time.monotonic.return_value = base + 601.0
+            mock_time.time.return_value = base + 601.0
+            # Confirm it is treated as a miss
+            self.assertIsNone(adapter._sender_name_cache.get("ou_expired"))
 
         async def _direct(func, *args, **kwargs):
             return func(*args, **kwargs)
@@ -3469,7 +3478,7 @@ class TestBotNameResolution(unittest.TestCase):
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        adapter._sender_name_cache["ou_peer"] = ("Peer Bot", time.time() + 600)
+        adapter._sender_name_cache["ou_peer"] = "Peer Bot"
         adapter._client = SimpleNamespace(
             request=lambda _r: (_ for _ in ()).throw(RuntimeError("should not fetch"))
         )
@@ -3487,7 +3496,7 @@ class TestBotNameResolution(unittest.TestCase):
             result = asyncio.run(adapter._resolve_sender_name_from_api("ou_peer", is_bot=True))
 
         self.assertEqual(result, "Peer Bot")
-        self.assertEqual(adapter._sender_name_cache["ou_peer"][0], "Peer Bot")
+        self.assertEqual(adapter._sender_name_cache["ou_peer"], "Peer Bot")
         self.assertEqual(len(calls), 1)
         self.assertIn("/open-apis/bot/v3/bots/basic_batch", calls[0].uri)
         # Feishu expects repeated ?bot_ids= params, not comma-joined.
@@ -3543,7 +3552,7 @@ class TestBotNameResolution(unittest.TestCase):
 
         self.assertIsNone(first)
         self.assertIsNone(second)
-        self.assertEqual(adapter._sender_name_cache["ou_nameless"][0], "")
+        self.assertEqual(adapter._sender_name_cache["ou_nameless"], "")
         self.assertEqual(len(calls), 1)
 
     @patch.dict(os.environ, {}, clear=True)

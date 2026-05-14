@@ -206,6 +206,8 @@ _DEFAULT_WEBHOOK_PATH = "/feishu/webhook"
 
 _FEISHU_DEDUP_TTL_SECONDS = 24 * 60 * 60          # 24 hours — matches openclaw
 _FEISHU_SENDER_NAME_TTL_SECONDS = 10 * 60          # 10 minutes sender-name cache
+_FEISHU_MESSAGE_TEXT_CACHE_TTL_SECONDS = 3600       # 1 hour message-text cache
+_FEISHU_CHAT_INFO_CACHE_TTL_SECONDS = 3600          # 1 hour chat-info cache
 _FEISHU_WEBHOOK_MAX_BODY_BYTES = 1 * 1024 * 1024   # 1 MB body limit
 _FEISHU_WEBHOOK_RATE_WINDOW_SECONDS = 60            # sliding window for rate limiter
 _FEISHU_WEBHOOK_RATE_LIMIT_MAX = 120               # max requests per window per IP — matches openclaw
@@ -214,6 +216,64 @@ _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
+
+# ---------------------------------------------------------------------------
+# Bounded TTL dictionary — LRU eviction + per-entry expiry, no external deps
+# ---------------------------------------------------------------------------
+
+class _BoundedTTLDict:
+    """Ordered-dict-backed cache with a capacity cap and per-entry TTL.
+
+    - Insertion order is maintained; when *maxsize* is reached the oldest
+      entry is evicted (LRU-by-insertion, not by access — sufficient here).
+    - Each entry stores (value, expire_at) where expire_at is a
+      ``time.monotonic()`` timestamp.  Expired entries are treated as misses
+      and lazily removed on the next access.
+    - Not thread-safe on its own; callers are responsible for locking when
+      concurrent writes are possible (matches existing dict behaviour).
+    """
+
+    def __init__(self, maxsize: int, ttl: float) -> None:
+        self._maxsize = maxsize
+        self._ttl = ttl
+        self._data: "OrderedDict[str, tuple]" = OrderedDict()
+
+    def get(self, key: str, default=None):
+        entry = self._data.get(key)
+        if entry is None:
+            return default
+        value, expire_at = entry
+        if time.monotonic() > expire_at:
+            self._data.pop(key, None)
+            return default
+        return value
+
+    def __contains__(self, key: str) -> bool:
+        return self.get(key, _SENTINEL) is not _SENTINEL
+
+    def __setitem__(self, key: str, value) -> None:
+        self._data.pop(key, None)  # re-insert at end to refresh order
+        self._data[key] = (value, time.monotonic() + self._ttl)
+        if len(self._data) > self._maxsize:
+            self._data.popitem(last=False)  # evict oldest
+
+    def __getitem__(self, key: str):
+        result = self.get(key, _SENTINEL)
+        if result is _SENTINEL:
+            raise KeyError(key)
+        return result
+
+    def pop(self, key: str, *args):
+        entry = self._data.pop(key, None)
+        if entry is None:
+            return args[0] if args else None
+        return entry[0]
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+_SENTINEL = object()  # unique miss marker for _BoundedTTLDict
 
 _APPROVAL_CHOICE_MAP: Dict[str, str] = {
     "approve_once": "once",
@@ -1399,7 +1459,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._seen_message_order: List[str] = []
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
-        self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
+        self._sender_name_cache: _BoundedTTLDict = _BoundedTTLDict(maxsize=1000, ttl=_FEISHU_SENDER_NAME_TTL_SECONDS)  # sender_id → name str
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
@@ -1413,8 +1473,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._chat_locks: Dict[str, asyncio.Lock] = {}  # chat_id → lock (per-chat serial processing)
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
-        self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
-        self._message_text_cache: Dict[str, Optional[str]] = {}
+        self._chat_info_cache: _BoundedTTLDict = _BoundedTTLDict(maxsize=500, ttl=_FEISHU_CHAT_INFO_CACHE_TTL_SECONDS)
+        self._message_text_cache: _BoundedTTLDict = _BoundedTTLDict(maxsize=2000, ttl=_FEISHU_MESSAGE_TEXT_CACHE_TTL_SECONDS)
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
@@ -3760,14 +3820,8 @@ class FeishuAdapter(BasePlatformAdapter):
         """Return a cached sender name only while its TTL is still valid."""
         if not sender_id:
             return None
-        cached = self._sender_name_cache.get(sender_id)
-        if cached is None:
-            return None
-        name, expire_at = cached
-        if time.time() < expire_at:
-            return name
-        self._sender_name_cache.pop(sender_id, None)
-        return None
+        # _BoundedTTLDict.get() returns None on miss or expiry
+        return self._sender_name_cache.get(sender_id)
 
     async def _resolve_sender_name_from_api(
         self,
@@ -3783,7 +3837,6 @@ class FeishuAdapter(BasePlatformAdapter):
         trimmed = sender_id.strip()
         if not trimmed:
             return None
-        now = time.time()
         cached_name = self._get_cached_sender_name(trimmed)
         if cached_name is not None:
             return cached_name or None  # "" cached means "known nameless"
@@ -3791,11 +3844,10 @@ class FeishuAdapter(BasePlatformAdapter):
             names = await self._fetch_bot_names([trimmed])
             if names is None:
                 return None
-            expire_at = now + _FEISHU_SENDER_NAME_TTL_SECONDS
             for oid, name in names.items():
-                self._sender_name_cache[oid] = (name, expire_at)
+                self._sender_name_cache[oid] = name
             hit = self._sender_name_cache.get(trimmed)
-            return (hit[0] or None) if hit else None
+            return (hit or None) if hit else None
         try:
             from lark_oapi.api.contact.v3 import GetUserRequest  # lazy import
             if trimmed.startswith("ou_"):
@@ -3818,7 +3870,7 @@ class FeishuAdapter(BasePlatformAdapter):
             if name and isinstance(name, str):
                 name = name.strip()
                 if name:
-                    self._sender_name_cache[trimmed] = (name, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
+                    self._sender_name_cache[trimmed] = name
                     return name
         except Exception:
             logger.debug("[Feishu] Failed to resolve sender name for %s", sender_id, exc_info=True)
