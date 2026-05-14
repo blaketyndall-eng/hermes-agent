@@ -312,6 +312,11 @@ def _detect_claude_code_version() -> str:
 
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 _MCP_TOOL_PREFIX = "mcp_"
+# Private flag stored on *input* message dicts (OpenAI-format) to mark that
+# their tool call names have already been prefixed with _MCP_TOOL_PREFIX.
+# This key is never present in the converted *anthropic_messages* dicts that
+# are sent to the API, so it cannot leak to the Anthropic SDK.
+_MCP_PREFIX_FLAG = "_mcp_tool_prefixed"
 
 
 def _get_claude_code_version() -> str:
@@ -1960,17 +1965,28 @@ def build_anthropic_kwargs(
                 if "name" in tool:
                     tool["name"] = _MCP_TOOL_PREFIX + tool["name"]
 
-        # 4. Prefix tool names in message history (tool_use and tool_result blocks)
-        for msg in anthropic_messages:
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") == "tool_use" and "name" in block:
-                            if not block["name"].startswith(_MCP_TOOL_PREFIX):
-                                block["name"] = _MCP_TOOL_PREFIX + block["name"]
-                        elif block.get("type") == "tool_result" and "tool_use_id" in block:
-                            pass  # tool_result uses ID, not name
+        # 4. Prefix tool call names in the *input* OpenAI-format message history.
+        #
+        # We mutate the caller's `messages` dicts (not `anthropic_messages`) and
+        # mark each processed dict with _MCP_PREFIX_FLAG so subsequent calls skip
+        # it — converting the per-turn O(N×B) scan to O(new_messages×B).
+        #
+        # Safety: _MCP_PREFIX_FLAG lives only on the OpenAI-format input dicts,
+        # which are never sent to the Anthropic SDK.  The converted
+        # `anthropic_messages` dicts are new objects produced by
+        # convert_messages_to_anthropic and contain no private flags.
+        for msg in messages:
+            if msg.get(_MCP_PREFIX_FLAG):
+                continue
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function")
+                    if isinstance(fn, dict) and "name" in fn:
+                        if not fn["name"].startswith(_MCP_TOOL_PREFIX):
+                            fn["name"] = _MCP_TOOL_PREFIX + fn["name"]
+            msg[_MCP_PREFIX_FLAG] = True
 
     kwargs: Dict[str, Any] = {
         "model": model,
