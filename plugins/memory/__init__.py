@@ -28,8 +28,9 @@ import logging
 import sys
 import threading
 import time
+import yaml
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,49 @@ def _invalidate_memory_provider_cache() -> None:
     global _discovery_cache
     with _discovery_cache_lock:
         _discovery_cache = None
+
+
+# ---------------------------------------------------------------------------
+# Per-plugin YAML parse cache (mtime-keyed)
+# ---------------------------------------------------------------------------
+
+_YAML_CACHE: Dict[Tuple[str, int], dict] = {}
+_YAML_CACHE_LOCK = threading.Lock()
+_YAML_CACHE_MAX = 64
+
+
+def _load_plugin_yaml(path: "Path") -> dict:
+    """Return the parsed YAML dict for *path*, using an mtime-keyed cache.
+
+    Re-parses only when the file's mtime_ns changes.  At most
+    ``_YAML_CACHE_MAX`` entries are kept; oldest entry is evicted when the
+    limit is reached (FIFO — acceptable for a tiny bounded cache).
+
+    Returns an empty dict on any OS or parse error.
+    """
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        return {}
+    key = (str(path), mtime)
+    with _YAML_CACHE_LOCK:
+        if key in _YAML_CACHE:
+            return _YAML_CACHE[key]
+        if len(_YAML_CACHE) >= _YAML_CACHE_MAX:
+            _YAML_CACHE.pop(next(iter(_YAML_CACHE)))  # FIFO eviction
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
+    except Exception:
+        data = {}
+    with _YAML_CACHE_LOCK:
+        _YAML_CACHE[key] = data
+    return data
+
+
+def _invalidate_plugin_yaml_cache() -> None:
+    """Clear the per-plugin YAML parse cache.  Intended for use in tests."""
+    with _YAML_CACHE_LOCK:
+        _YAML_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -199,9 +243,7 @@ def discover_memory_providers() -> List[Tuple[str, str, bool]]:
         yaml_file = child / "plugin.yaml"
         if yaml_file.exists():
             try:
-                import yaml
-                with open(yaml_file, encoding="utf-8-sig") as f:
-                    meta = yaml.safe_load(f) or {}
+                meta = _load_plugin_yaml(yaml_file)
                 desc = meta.get("description", "")
             except Exception:
                 pass
@@ -448,9 +490,7 @@ def discover_plugin_cli_commands() -> List[dict]:
         yaml_file = plugin_dir / "plugin.yaml"
         if yaml_file.exists():
             try:
-                import yaml
-                with open(yaml_file, encoding="utf-8-sig") as f:
-                    meta = yaml.safe_load(f) or {}
+                meta = _load_plugin_yaml(yaml_file)
                 desc = meta.get("description", "")
                 if desc:
                     help_text = desc
