@@ -141,3 +141,111 @@ class TestApplyAnthropicCacheControl:
             elif "cache_control" in msg:
                 count += 1
         assert count <= 4
+
+
+class TestApplyAnthropicCacheControlAliasing:
+    """Targeted shallow-copy contract: unmodified messages share references
+    with the input; modified messages are independent copies; the input list
+    and dicts are never mutated."""
+
+    def _build_long_session(self, n_total: int = 200):
+        msgs = [{"role": "system", "content": "You are helpful"}]
+        for i in range(n_total - 1):
+            role = "user" if i % 2 == 0 else "assistant"
+            msgs.append(
+                {
+                    "role": role,
+                    "content": [
+                        {"type": "text", "text": f"turn {i} block 0"},
+                        {"type": "text", "text": f"turn {i} block 1"},
+                    ],
+                }
+            )
+        return msgs
+
+    def test_id_isolation_marked_vs_unmarked(self):
+        msgs = self._build_long_session(n_total=200)
+        result = apply_anthropic_cache_control(msgs)
+
+        assert result is not msgs
+        assert len(result) == len(msgs)
+
+        non_sys = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+        marked = {0, *non_sys[-3:]}
+
+        for i, (orig, new) in enumerate(zip(msgs, result)):
+            if i in marked:
+                assert new is not orig, f"marked index {i} should be a copy"
+                if isinstance(orig.get("content"), list) and isinstance(
+                    new.get("content"), list
+                ):
+                    assert new["content"] is not orig["content"]
+                    for a, b in zip(orig["content"], new["content"]):
+                        if isinstance(a, dict):
+                            assert a is not b
+            else:
+                assert new is orig, f"unmarked index {i} should share reference"
+
+    def test_no_mutation_of_input(self):
+        import copy as _copy
+
+        msgs = self._build_long_session(n_total=50)
+        snapshot = _copy.deepcopy(msgs)
+        _ = apply_anthropic_cache_control(msgs)
+        assert msgs == snapshot, "input api_messages must not be mutated"
+
+    def test_behavioral_parity_with_deepcopy_reference(self):
+        import copy as _copy
+
+        def _reference_impl(api_messages, cache_ttl="5m", native_anthropic=False):
+            messages = _copy.deepcopy(api_messages)
+            if not messages:
+                return messages
+            marker = {"type": "ephemeral"}
+            if cache_ttl == "1h":
+                marker["ttl"] = "1h"
+            breakpoints_used = 0
+            if messages[0].get("role") == "system":
+                _apply_cache_marker(
+                    messages[0], marker, native_anthropic=native_anthropic
+                )
+                breakpoints_used += 1
+            remaining = 4 - breakpoints_used
+            non_sys = [
+                i
+                for i in range(len(messages))
+                if messages[i].get("role") != "system"
+            ]
+            for idx in non_sys[-remaining:]:
+                _apply_cache_marker(
+                    messages[idx], marker, native_anthropic=native_anthropic
+                )
+            return messages
+
+        scenarios = [
+            self._build_long_session(n_total=200),
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "tool", "content": "result", "tool_call_id": "x"},
+            ],
+            [{"role": "user", "content": "only one"}],
+            [
+                {"role": "user", "content": [{"type": "text", "text": "a"}]},
+                {"role": "assistant", "content": None},
+            ],
+        ]
+        for msgs in scenarios:
+            for ttl in ("5m", "1h"):
+                for native in (False, True):
+                    a = apply_anthropic_cache_control(
+                        msgs, cache_ttl=ttl, native_anthropic=native
+                    )
+                    b = _reference_impl(
+                        msgs, cache_ttl=ttl, native_anthropic=native
+                    )
+                    assert a == b, (
+                        f"parity mismatch ttl={ttl} native={native} "
+                        f"scenario_len={len(msgs)}"
+                    )

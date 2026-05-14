@@ -8,7 +8,6 @@ single session.
 Pure functions -- no class state, no AIAgent dependency.
 """
 
-import copy
 from typing import Any, Dict, List
 
 
@@ -57,23 +56,36 @@ def apply_anthropic_cache_control(
     messages, all at the same TTL.
 
     Returns:
-        Deep copy of messages with cache_control breakpoints injected.
+        A new list with the same message references as the input, except the
+        up-to-4 messages receiving cache_control markers are shallow-copied
+        (dict + content blocks). The original ``api_messages`` list and all
+        unmodified message dicts are never mutated.
     """
-    messages = copy.deepcopy(api_messages)
-    if not messages:
-        return messages
+    if not api_messages:
+        return list(api_messages)
 
     marker = _build_marker(cache_ttl)
 
-    breakpoints_used = 0
+    marker_indices: List[int] = []
+    if api_messages[0].get("role") == "system":
+        marker_indices.append(0)
 
-    if messages[0].get("role") == "system":
-        _apply_cache_marker(messages[0], marker, native_anthropic=native_anthropic)
-        breakpoints_used += 1
+    remaining = 4 - len(marker_indices)
+    non_sys = [
+        i for i in range(len(api_messages)) if api_messages[i].get("role") != "system"
+    ]
+    marker_indices.extend(non_sys[-remaining:])
 
-    remaining = 4 - breakpoints_used
-    non_sys = [i for i in range(len(messages)) if messages[i].get("role") != "system"]
-    for idx in non_sys[-remaining:]:
-        _apply_cache_marker(messages[idx], marker, native_anthropic=native_anthropic)
+    out = list(api_messages)
+    for idx in marker_indices:
+        src = out[idx]
+        msg = dict(src)
+        content = msg.get("content")
+        if isinstance(content, list):
+            msg["content"] = [
+                dict(b) if isinstance(b, dict) else b for b in content
+            ]
+        _apply_cache_marker(msg, marker, native_anthropic=native_anthropic)
+        out[idx] = msg
 
-    return messages
+    return out
