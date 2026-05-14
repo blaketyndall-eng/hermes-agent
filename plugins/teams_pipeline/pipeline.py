@@ -14,8 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
-import httpx
-
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 from hermes_constants import get_hermes_home
 from plugins.teams_pipeline.meetings import (
@@ -133,6 +131,7 @@ class NotionWriter:
             "Notion-Version": self.API_VERSION,
             "Content-Type": "application/json",
         }
+        import httpx
         async with httpx.AsyncClient(timeout=30.0, transport=self._transport) as client:
             if page_id:
                 response = await client.patch(
@@ -225,6 +224,7 @@ class LinearWriter:
         description = _render_summary_markdown(payload)
         existing_issue_id = (existing_record or {}).get("issue_id")
 
+        import httpx
         async with httpx.AsyncClient(timeout=30.0, transport=self._transport) as client:
             if existing_issue_id:
                 response = await client.post(

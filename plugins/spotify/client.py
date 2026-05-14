@@ -6,8 +6,6 @@ import json
 from typing import Any, Dict, Iterable, Optional
 from urllib.parse import urlparse
 
-import httpx
-
 from hermes_cli.auth import (
     AuthError,
     resolve_spotify_runtime_credentials,
@@ -71,6 +69,7 @@ class SpotifyClient:
         allow_retry_on_401: bool = True,
         empty_response: Optional[Dict[str, Any]] = None,
     ) -> Any:
+        import httpx
         url = f"{self.base_url}{path}"
         response = httpx.request(
             method,
