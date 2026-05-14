@@ -1,13 +1,101 @@
 from __future__ import annotations
 
+import logging
 import re
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Callable, Dict, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
 from utils import base_url_host_matches
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Stale-while-revalidate (SWR) metadata cache
+#
+# Custom endpoints previously used a 5-minute TTL, which triggered a
+# synchronous HTTP fetch in the hot path every 300 s during a long session.
+# This layer adds:
+#   1. A unified 1-hour fresh TTL for all routes (was 300 s for custom).
+#   2. SWR: values between _TTL_FRESH and _TTL_STALE are returned immediately
+#      while a background thread refreshes the cache entry.
+#   3. A per-module lock prevents multiple concurrent background refreshes for
+#      the same key. The module is primarily consumed from a single agent
+#      thread, but background refresh threads write back results, so the lock
+#      is necessary for correctness.
+# ---------------------------------------------------------------------------
+
+_TTL_FRESH = 3600.0   # seconds — return from cache without any refresh
+_TTL_STALE = 7200.0   # seconds — serve stale + kick off background refresh;
+                       # beyond this threshold we block and fetch synchronously
+
+
+@dataclass
+class _CacheEntry:
+    value: Any
+    fetched_at: float
+    refresh_in_flight: bool = False
+
+
+# Module-level cache and a single lock that guards all mutations.
+_PRICING_CACHE: Dict[str, _CacheEntry] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _background_refresh(key: str, fetcher: Callable[[], Any]) -> None:
+    """Run *fetcher* in a background daemon thread and update the cache."""
+    try:
+        new_value = fetcher()
+        with _CACHE_LOCK:
+            _PRICING_CACHE[key] = _CacheEntry(value=new_value, fetched_at=time.monotonic())
+        logger.debug("SWR background refresh completed for key %r", key)
+    except Exception as exc:
+        logger.warning("SWR background refresh failed for key %r: %s", key, exc)
+        # Clear the in-flight flag so the next caller can retry.
+        with _CACHE_LOCK:
+            entry = _PRICING_CACHE.get(key)
+            if entry is not None:
+                entry.refresh_in_flight = False
+
+
+def _get_cached_metadata(key: str, fetcher: Callable[[], Any]) -> Any:
+    """Return cached metadata for *key*, using SWR semantics.
+
+    - Fresh (age < _TTL_FRESH): return cached value immediately.
+    - Stale (_TTL_FRESH <= age < _TTL_STALE): return cached value and start a
+      background refresh if none is already in flight.
+    - Too-stale (age >= _TTL_STALE) or cold: block on fetcher(), cache, return.
+    """
+    now = time.monotonic()
+
+    with _CACHE_LOCK:
+        entry = _PRICING_CACHE.get(key)
+        if entry is not None:
+            age = now - entry.fetched_at
+            if age < _TTL_FRESH:
+                # Fresh — return immediately, no refresh needed.
+                return entry.value
+            if age < _TTL_STALE:
+                # Stale but usable — return immediately and maybe refresh.
+                if not entry.refresh_in_flight:
+                    entry.refresh_in_flight = True
+                    threading.Thread(
+                        target=_background_refresh,
+                        args=(key, fetcher),
+                        daemon=True,
+                    ).start()
+                return entry.value
+            # Too stale — fall through to synchronous fetch below.
+
+    # Cold start or too-stale: fetch synchronously (blocks caller).
+    value = fetcher()
+    with _CACHE_LOCK:
+        _PRICING_CACHE[key] = _CacheEntry(value=value, fetched_at=time.monotonic())
+    return value
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 
@@ -587,8 +675,9 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
 
 
 def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+    metadata = _get_cached_metadata("openrouter", fetch_model_metadata)
     return _pricing_entry_from_metadata(
-        fetch_model_metadata(),
+        metadata,
         route.model,
         source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
         pricing_version="openrouter-models-api",
@@ -658,8 +747,13 @@ def get_pricing_entry(
     if route.provider == "openrouter":
         return _openrouter_pricing_entry(route)
     if route.base_url:
+        _endpoint_key = f"endpoint:{route.base_url}"
+        _endpoint_fetcher = lambda: fetch_endpoint_model_metadata(  # noqa: E731
+            route.base_url, api_key=api_key or ""
+        )
+        endpoint_metadata = _get_cached_metadata(_endpoint_key, _endpoint_fetcher)
         entry = _pricing_entry_from_metadata(
-            fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""),
+            endpoint_metadata,
             route.model,
             source_url=f"{route.base_url.rstrip('/')}/models",
             pricing_version="openai-compatible-models-api",
