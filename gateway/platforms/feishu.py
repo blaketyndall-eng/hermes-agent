@@ -127,6 +127,7 @@ FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms._feishu_async import FeishuAsyncTransport
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -1383,6 +1384,10 @@ class FeishuAdapter(BasePlatformAdapter):
         self._settings = self._load_settings(config.extra or {})
         self._apply_settings(self._settings)
         self._client: Optional[Any] = None
+        # Async httpx fast-path for hot IM message sends; built lazily in
+        # _connect_websocket / _connect_webhook once self._client exists,
+        # closed in disconnect().  See gateway.platforms._feishu_async.
+        self._async_transport: Optional[FeishuAsyncTransport] = None
         self._ws_client: Optional[Any] = None
         self._ws_future: Optional[asyncio.Future] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1672,6 +1677,11 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_thread_loop = None
         self._loop = None
         self._event_handler = None
+        # Tear down the async httpx transport last so any in-flight send
+        # awaiters above have already settled before we close the client.
+        if self._async_transport is not None:
+            await self._async_transport.aclose()
+            self._async_transport = None
         self._persist_seen_message_ids()
         await self._release_app_lock()
 
@@ -4280,12 +4290,27 @@ class FeishuAdapter(BasePlatformAdapter):
         if not effective_reply_to and metadata and metadata.get("thread_id"):
             effective_reply_to = metadata.get("reply_to_message_id")
         reply_in_thread = bool((metadata or {}).get("thread_id"))
+        uuid_value = str(uuid.uuid4())
         if effective_reply_to:
+            # Hot path: route through the async httpx transport so we
+            # don't pin a threadpool worker for 200–800 ms per send.
+            # See gateway.platforms._feishu_async.  When the transport
+            # isn't available (e.g. tests that build an adapter without
+            # going through _connect_*), fall back to the original
+            # blocking SDK path so behavior remains identical.
+            if self._async_transport is not None:
+                return await self._async_transport.reply_message(
+                    message_id=effective_reply_to,
+                    msg_type=msg_type,
+                    content=payload,
+                    reply_in_thread=reply_in_thread,
+                    uuid_value=uuid_value,
+                )
             body = self._build_reply_message_body(
                 content=payload,
                 msg_type=msg_type,
                 reply_in_thread=reply_in_thread,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=uuid_value,
             )
             request = self._build_reply_message_request(effective_reply_to, body)
             return await asyncio.to_thread(self._client.im.v1.message.reply, request)
@@ -4295,26 +4320,32 @@ class FeishuAdapter(BasePlatformAdapter):
         # the main chat.
         _thread_id = (metadata or {}).get("thread_id")
         if _thread_id:
-            body = self._build_create_message_body(
-                receive_id=_thread_id,
-                msg_type=msg_type,
-                content=payload,
-                uuid_value=str(uuid.uuid4()),
-            )
-            request = self._build_create_message_request("thread_id", body)
+            receive_id_type = "thread_id"
+            receive_id = _thread_id
         else:
-            body = self._build_create_message_body(
-                receive_id=chat_id,
-                msg_type=msg_type,
-                content=payload,
-                uuid_value=str(uuid.uuid4()),
-            )
+            receive_id = chat_id
             # Detect whether chat_id is a user open_id (DM) or a chat_id (group).
             if chat_id.startswith("ou_"):
                 receive_id_type = "open_id"
             else:
                 receive_id_type = "chat_id"
-            request = self._build_create_message_request(receive_id_type, body)
+        # Hot path: async httpx transport when available; SDK fallback
+        # otherwise (see comment above).
+        if self._async_transport is not None:
+            return await self._async_transport.send_message(
+                receive_id_type=receive_id_type,
+                receive_id=receive_id,
+                msg_type=msg_type,
+                content=payload,
+                uuid_value=uuid_value,
+            )
+        body = self._build_create_message_body(
+            receive_id=receive_id,
+            msg_type=msg_type,
+            content=payload,
+            uuid_value=uuid_value,
+        )
+        request = self._build_create_message_request(receive_id_type, body)
         return await asyncio.to_thread(self._client.im.v1.message.create, request)
 
     @staticmethod
@@ -4384,6 +4415,7 @@ class FeishuAdapter(BasePlatformAdapter):
             raise RuntimeError("websockets not installed; websocket mode unavailable")
         domain = FEISHU_DOMAIN if self._domain_name != "lark" else LARK_DOMAIN
         self._client = self._build_lark_client(domain)
+        self._async_transport = self._try_build_async_transport()
         self._event_handler = self._build_event_handler()
         if self._event_handler is None:
             raise RuntimeError("failed to build Feishu event handler")
@@ -4410,6 +4442,7 @@ class FeishuAdapter(BasePlatformAdapter):
             raise RuntimeError("aiohttp not installed; webhook mode unavailable")
         domain = FEISHU_DOMAIN if self._domain_name != "lark" else LARK_DOMAIN
         self._client = self._build_lark_client(domain)
+        self._async_transport = self._try_build_async_transport()
         self._event_handler = self._build_event_handler()
         if self._event_handler is None:
             raise RuntimeError("failed to build Feishu event handler")
@@ -4430,6 +4463,25 @@ class FeishuAdapter(BasePlatformAdapter):
             .log_level(lark.LogLevel.WARNING)
             .build()
         )
+
+    def _try_build_async_transport(self) -> Optional[FeishuAsyncTransport]:
+        """Build the async httpx transport when the SDK client exposes
+        the ``_config`` we depend on; otherwise fall back to None and
+        the SDK-via-to_thread path remains in effect.
+
+        Tests routinely mock ``_build_lark_client`` to return a bare
+        ``SimpleNamespace``, so we accept that and silently skip the
+        transport rather than failing the whole connect.
+        """
+        try:
+            return FeishuAsyncTransport(sdk_client=self._client)
+        except (RuntimeError, ValueError) as exc:
+            logger.debug(
+                "[Feishu] async transport unavailable, falling back to "
+                "SDK + asyncio.to_thread: %s",
+                exc,
+            )
+            return None
 
     async def _feishu_send_with_retry(
         self,
