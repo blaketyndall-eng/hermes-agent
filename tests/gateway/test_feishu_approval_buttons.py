@@ -452,7 +452,7 @@ class TestCardActionCallbackResponse:
             {"hermes_action": "approve_once", "approval_id": 1},
             open_id="ou_bob",
         )
-        adapter._sender_name_cache["ou_bob"] = ("Bob", 9999999999)
+        adapter._sender_name_cache["ou_bob"] = "Bob"
 
         with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
             response = adapter._on_card_action_trigger(data)
@@ -529,7 +529,13 @@ class TestCardActionCallbackResponse:
             {"hermes_action": "approve_once", "approval_id": 4},
             open_id="ou_expired",
         )
-        adapter._sender_name_cache["ou_expired"] = ("Old Name", 1)
+        # Store entry as if placed far in the past so it is already expired
+        import time as _time
+        from unittest.mock import patch as _patch
+        with _patch("gateway.platforms.feishu.time") as _mt:
+            _mt.monotonic.return_value = 1.0
+            _mt.time.return_value = 1.0
+            adapter._sender_name_cache["ou_expired"] = "Old Name"
 
         with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
             response = adapter._on_card_action_trigger(data)
@@ -551,7 +557,7 @@ class TestCardActionCallbackResponse:
             {"hermes_update_prompt_action": "y", "update_prompt_id": 1},
             open_id="ou_bob",
         )
-        adapter._sender_name_cache["ou_bob"] = ("Bob", 9999999999)
+        adapter._sender_name_cache["ou_bob"] = "Bob"
 
         with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
             response = adapter._on_card_action_trigger(data)

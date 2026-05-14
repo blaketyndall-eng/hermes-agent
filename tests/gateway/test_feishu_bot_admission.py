@@ -491,7 +491,8 @@ def test_resolve_sender_profile_uses_open_id_for_bot_name_lookup():
 
     adapter = object.__new__(FeishuAdapter)
     adapter._client = object()
-    adapter._sender_name_cache = {}
+    from gateway.platforms.feishu import _BoundedTTLDict, _FEISHU_SENDER_NAME_TTL_SECONDS
+    adapter._sender_name_cache = _BoundedTTLDict(maxsize=1000, ttl=_FEISHU_SENDER_NAME_TTL_SECONDS)
     seen_ids = []
 
     async def _fake_fetch_bot_names(bot_ids):
