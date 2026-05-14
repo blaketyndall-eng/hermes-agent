@@ -21,10 +21,13 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import logging
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 from hermes_cli.config import cfg_get
@@ -32,6 +35,49 @@ from hermes_cli.config import cfg_get
 logger = logging.getLogger(__name__)
 
 _MEMORY_PLUGINS_DIR = Path(__file__).parent
+
+# ---------------------------------------------------------------------------
+# Discovery cache (TTL + mtime-keyed)
+# ---------------------------------------------------------------------------
+
+_DISCOVERY_CACHE_TTL: float = 60.0
+# Tuple layout: (expires_at, mtime_hash, providers)
+_discovery_cache: Optional[Tuple[float, str, List[Tuple[str, str, bool]]]] = None
+_discovery_cache_lock = threading.Lock()
+
+
+def _mtime_hash(provider_dirs: List[Tuple[str, Path]]) -> str:
+    """Compute a stable hash over top-level provider dirs and their plugin.yaml files.
+
+    Covers:
+    - The mtime of each provider directory itself (detects new/removed files
+      inside the dir via the dir's own mtime on most filesystems).
+    - The mtime of ``plugin.yaml`` inside each provider dir (detects edits to
+      plugin metadata without a directory-level mtime bump).
+    """
+    parts: List[str] = []
+    for name, path in provider_dirs:
+        try:
+            parts.append(f"{name}:{path.stat().st_mtime_ns}")
+        except OSError:
+            parts.append(f"{name}:missing")
+        yaml_file = path / "plugin.yaml"
+        try:
+            parts.append(f"{name}/plugin.yaml:{yaml_file.stat().st_mtime_ns}")
+        except OSError:
+            parts.append(f"{name}/plugin.yaml:missing")
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+
+def _invalidate_memory_provider_cache() -> None:
+    """Discard the cached provider list, forcing a full rediscovery on next call.
+
+    Intended for use in tests and for explicit cache invalidation after
+    programmatic plugin installation.
+    """
+    global _discovery_cache
+    with _discovery_cache_lock:
+        _discovery_cache = None
 
 
 # ---------------------------------------------------------------------------
@@ -125,10 +171,29 @@ def discover_memory_providers() -> List[Tuple[str, str, bool]]:
 
     Returns list of (name, description, is_available) tuples.
     Bundled providers take precedence on name collisions.
-    """
-    results = []
 
-    for name, child in _iter_provider_dirs():
+    Results are cached for up to ``_DISCOVERY_CACHE_TTL`` seconds and
+    additionally keyed on a hash of each provider directory's mtime and its
+    ``plugin.yaml`` mtime.  This means the cache is invalidated automatically
+    whenever a provider directory or its plugin.yaml changes on disk, even
+    within the TTL window.  Call :func:`_invalidate_memory_provider_cache` to
+    force an immediate reload.
+    """
+    global _discovery_cache
+
+    provider_dirs = _iter_provider_dirs()
+    current_hash = _mtime_hash(provider_dirs)
+    now = time.monotonic()
+
+    with _discovery_cache_lock:
+        entry = _discovery_cache
+        if entry is not None and entry[0] > now and entry[1] == current_hash:
+            return entry[2]
+
+    # Cache miss — perform full discovery.
+    results: List[Tuple[str, str, bool]] = []
+
+    for name, child in provider_dirs:
         # Read description from plugin.yaml if available
         desc = ""
         yaml_file = child / "plugin.yaml"
@@ -153,6 +218,9 @@ def discover_memory_providers() -> List[Tuple[str, str, bool]]:
             available = False
 
         results.append((name, desc, available))
+
+    with _discovery_cache_lock:
+        _discovery_cache = (now + _DISCOVERY_CACHE_TTL, current_hash, results)
 
     return results
 
