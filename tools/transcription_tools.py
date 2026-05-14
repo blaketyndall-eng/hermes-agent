@@ -28,6 +28,7 @@ Usage::
 
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -153,9 +154,47 @@ def _find_whisper_binary() -> Optional[str]:
     return _find_binary("whisper")
 
 
+_SHELL_METACHAR_RE = re.compile(r'[`$;|&<>]')
+
+_SHELL_METACHAR_NAMES: dict[str, str] = {
+    '`': 'backtick (command substitution)',
+    '$': 'dollar sign (variable/command substitution)',
+    ';': 'semicolon (command separator)',
+    '|': 'pipe (command chaining)',
+    '&': 'ampersand (background execution / logical AND)',
+    '<': 'less-than (input redirection)',
+    '>': 'greater-than (output redirection)',
+}
+
+
+def _validate_stt_command_template(template: str) -> None:
+    """Raise ValueError if *template* (the raw env-var value, before placeholder
+    substitution) contains shell metacharacters that would allow injection when
+    the command is later split with shlex.split and executed with shell=False.
+
+    Accepted placeholders: {input_path}, {output_dir}, {language}, {model}.
+    Rejected: any of ` $ ; | & < >
+
+    If your STT command legitimately needs shell features (pipes, redirection),
+    wrap it in an explicit shell script and point HERMES_LOCAL_STT_COMMAND at
+    that script instead of embedding shell syntax in the env var.
+    """
+    match = _SHELL_METACHAR_RE.search(template)
+    if match:
+        char = match.group(0)
+        description = _SHELL_METACHAR_NAMES.get(char, repr(char))
+        raise ValueError(
+            f"LOCAL_STT_COMMAND contains shell metacharacter {char!r} "
+            f"({description}) — refusing to execute. "
+            "If you need shell features (pipes, redirection), put them in a "
+            "wrapper script and set HERMES_LOCAL_STT_COMMAND to that script path."
+        )
+
+
 def _get_local_command_template() -> Optional[str]:
     configured = os.getenv(LOCAL_STT_COMMAND_ENV, "").strip()
     if configured:
+        _validate_stt_command_template(configured)
         return configured
 
     whisper_binary = _find_whisper_binary()
@@ -505,12 +544,10 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
                 language=shlex.quote(language),
                 model=shlex.quote(normalized_model),
             )
-            # User-provided templates (env var) may contain shell syntax; auto-detected commands are safe for list mode.
-            use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())
-            if use_shell:
-                subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
-            else:
-                subprocess.run(shlex.split(command), check=True, capture_output=True, text=True)
+            # shell=False: template was validated for metacharacters at load
+            # time (_validate_stt_command_template), and each substituted value
+            # is individually shlex.quote()'d above, so shlex.split() is safe.
+            subprocess.run(shlex.split(command), shell=False, check=True, capture_output=True, text=True)
             
 
             txt_files = sorted(Path(output_dir).glob("*.txt"))

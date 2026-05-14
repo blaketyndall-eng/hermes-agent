@@ -388,12 +388,15 @@ class TestTranscribeLocalCommand:
             return _TempDir()
 
         def fake_run(cmd, *args, **kwargs):
-            if isinstance(cmd, list):
+            # Both ffmpeg (audio conversion) and whisper (STT) are now called
+            # with a list (shell=False).  Distinguish them by executable name.
+            if isinstance(cmd, list) and cmd and "ffmpeg" in cmd[0]:
                 output_path = cmd[-1]
                 with open(output_path, "wb") as handle:
                     handle.write(b"RIFF....WAVEfmt ")
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
+            # whisper STT command — write the expected .txt transcript
             (out_dir / "test.txt").write_text("hello from local command\n", encoding="utf-8")
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -1390,18 +1393,67 @@ class TestShellSafety:
         assert parts[0] == "/usr/bin/whisper"
         assert "/tmp/test.wav" in parts
 
-    def test_env_var_template_uses_shell_path(self, monkeypatch):
-        """When HERMES_LOCAL_STT_COMMAND is set, use_shell should be True."""
-        import os
-        from tools.transcription_tools import LOCAL_STT_COMMAND_ENV
-        monkeypatch.setenv(LOCAL_STT_COMMAND_ENV, "whisper {input_path} | tee log.txt")
-        use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())
-        assert use_shell is True
+    # ------------------------------------------------------------------
+    # W3-S1: template metacharacter validation (shell=True injection fix)
+    # ------------------------------------------------------------------
 
-    def test_no_env_var_uses_list_mode(self, monkeypatch):
-        """When no env var is set, use_shell should be False."""
-        import os
-        from tools.transcription_tools import LOCAL_STT_COMMAND_ENV
-        monkeypatch.delenv(LOCAL_STT_COMMAND_ENV, raising=False)
-        use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())
-        assert use_shell is False
+    def test_local_stt_command_rejects_backticks(self, monkeypatch):
+        """Backtick command substitution in the template must be rejected."""
+        monkeypatch.setenv("HERMES_LOCAL_STT_COMMAND", "whisper `id` -o {output_dir}")
+        from tools.transcription_tools import _get_local_command_template
+        with pytest.raises(ValueError, match="shell metacharacter"):
+            _get_local_command_template()
+
+    def test_local_stt_command_rejects_dollar_paren(self, monkeypatch):
+        """$(...) command substitution in the template must be rejected."""
+        monkeypatch.setenv("HERMES_LOCAL_STT_COMMAND", "whisper $(id) -o {output_dir}")
+        from tools.transcription_tools import _get_local_command_template
+        with pytest.raises(ValueError, match="shell metacharacter"):
+            _get_local_command_template()
+
+    def test_local_stt_command_rejects_semicolon(self, monkeypatch):
+        """Semicolon command separator in the template must be rejected."""
+        monkeypatch.setenv(
+            "HERMES_LOCAL_STT_COMMAND",
+            "whisper {input_path}; rm -rf /",
+        )
+        from tools.transcription_tools import _get_local_command_template
+        with pytest.raises(ValueError, match="shell metacharacter"):
+            _get_local_command_template()
+
+    def test_local_stt_command_works_for_safe_template(self, monkeypatch, tmp_path):
+        """A safe template is accepted and subprocess.run is called with shell=False."""
+        audio = tmp_path / "audio.wav"
+        audio.write_bytes(b"fake")
+
+        monkeypatch.setenv(
+            "HERMES_LOCAL_STT_COMMAND",
+            "whisper {input_path} -o {output_dir}",
+        )
+
+        def fake_run(argv, shell=False, check=False, capture_output=False, text=False):
+            # Write a transcript file so the caller can read it back.
+            import pathlib
+            # Locate the output_dir from the -o flag in argv
+            for i, tok in enumerate(argv):
+                if tok == "-o" and i + 1 < len(argv):
+                    pathlib.Path(argv[i + 1]).mkdir(parents=True, exist_ok=True)
+                    (pathlib.Path(argv[i + 1]) / "audio.txt").write_text("hello world")
+                    break
+            assert shell is False, "subprocess.run must be called with shell=False"
+            assert argv[0] == "whisper", f"Expected 'whisper' as argv[0], got {argv[0]!r}"
+            assert str(audio) in argv, "audio path must appear in argv"
+            return MagicMock(returncode=0)
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
+             patch("tools.transcription_tools._prepare_local_audio",
+                   return_value=(str(audio), None)), \
+             patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._normalize_local_command_model",
+                   return_value="base"):
+            from tools.transcription_tools import _transcribe_local_command
+            result = _transcribe_local_command(str(audio), "base")
+
+        assert result["success"] is True
+        assert result["transcript"] == "hello world"
