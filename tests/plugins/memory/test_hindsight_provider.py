@@ -1549,3 +1549,89 @@ class TestShutdown:
         assert embedded._client is None
         assert provider._client is None
 
+
+# ---------------------------------------------------------------------------
+# Auto-upgrade gate tests (W3-S3)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoUpgradeGate:
+    """Tests for HERMES_HINDSIGHT_AUTO_UPGRADE opt-in behaviour."""
+
+    def _make_provider(self, tmp_path, monkeypatch):
+        """Return a bare HindsightMemoryProvider with cloud config, no client."""
+        config = {
+            "mode": "cloud",
+            "apiKey": "test-key",
+            "api_url": "http://localhost:9999",
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+        )
+        return HindsightMemoryProvider()
+
+    def test_hindsight_refuses_init_when_version_too_low_and_no_env_var(
+        self, tmp_path, monkeypatch
+    ):
+        """When installed version < minimum and HERMES_HINDSIGHT_AUTO_UPGRADE is not set,
+        the provider must mark itself unavailable and must NOT call subprocess.run."""
+        from unittest.mock import patch
+
+        provider = self._make_provider(tmp_path, monkeypatch)
+        monkeypatch.delenv("HERMES_HINDSIGHT_AUTO_UPGRADE", raising=False)
+
+        with patch(
+            "plugins.memory.hindsight.importlib.metadata.version", return_value="0.1.0"
+        ) as _mock_ver, patch("subprocess.run") as mock_run:
+            provider.initialize(session_id="s1", hermes_home=str(tmp_path), platform="cli")
+
+        assert provider._version_check_failed is True
+        assert provider.is_available() is False
+        mock_run.assert_not_called()
+
+    def test_hindsight_auto_upgrade_only_when_env_set(
+        self, tmp_path, monkeypatch
+    ):
+        """When HERMES_HINDSIGHT_AUTO_UPGRADE=1 and version is too low,
+        subprocess.run must be called with the pip install command."""
+        from unittest.mock import patch
+
+        provider = self._make_provider(tmp_path, monkeypatch)
+        monkeypatch.setenv("HERMES_HINDSIGHT_AUTO_UPGRADE", "1")
+
+        fake_uv = "/usr/bin/uv"
+
+        with patch(
+            "plugins.memory.hindsight.importlib.metadata.version", return_value="0.1.0"
+        ), patch("shutil.which", return_value=fake_uv), \
+             patch("subprocess.run") as mock_run:
+            provider.initialize(session_id="s2", hermes_home=str(tmp_path), platform="cli")
+
+        assert provider._version_check_failed is False
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args[0][0]
+        assert "pip" in call_args
+        assert "install" in call_args
+        assert any("hindsight-client" in arg for arg in call_args)
+
+    def test_hindsight_does_not_upgrade_when_version_ok(
+        self, tmp_path, monkeypatch
+    ):
+        """When installed version >= minimum, no upgrade should be attempted
+        regardless of the env var."""
+        from unittest.mock import patch
+
+        provider = self._make_provider(tmp_path, monkeypatch)
+        monkeypatch.setenv("HERMES_HINDSIGHT_AUTO_UPGRADE", "1")
+
+        with patch(
+            "plugins.memory.hindsight.importlib.metadata.version", return_value="99.0.0"
+        ), patch("subprocess.run") as mock_run:
+            provider.initialize(session_id="s3", hermes_home=str(tmp_path), platform="cli")
+
+        assert provider._version_check_failed is False
+        mock_run.assert_not_called()
+

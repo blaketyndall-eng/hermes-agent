@@ -584,12 +584,15 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
         self._bank_id_template = ""
+        self._version_check_failed = False
 
     @property
     def name(self) -> str:
         return "hindsight"
 
     def is_available(self) -> bool:
+        if self._version_check_failed:
+            return False
         try:
             cfg = _load_config()
             mode = cfg.get("mode", "cloud")
@@ -1066,31 +1069,44 @@ class HindsightMemoryProvider(MemoryProvider):
         start_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self._document_id = f"{self._session_id}-{start_ts}"
 
-        # Check client version and auto-upgrade if needed
+        # Check client version; auto-upgrade only if HERMES_HINDSIGHT_AUTO_UPGRADE=1
         try:
             from importlib.metadata import version as pkg_version
             from packaging.version import Version
             installed = pkg_version("hindsight-client")
             if Version(installed) < Version(_MIN_CLIENT_VERSION):
-                logger.warning("hindsight-client %s is outdated (need >=%s), attempting upgrade...",
-                               installed, _MIN_CLIENT_VERSION)
-                import shutil
-                import subprocess
-                import sys
-                uv_path = shutil.which("uv")
-                if uv_path:
-                    try:
-                        subprocess.run(
-                            [uv_path, "pip", "install", "--python", sys.executable,
-                             "--quiet", "--upgrade", f"hindsight-client>={_MIN_CLIENT_VERSION}"],
-                            check=True, timeout=120, capture_output=True,
-                        )
-                        logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
-                    except Exception as e:
-                        logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
-                                       e, _MIN_CLIENT_VERSION)
+                if os.environ.get("HERMES_HINDSIGHT_AUTO_UPGRADE", "0") == "1":
+                    logger.warning(
+                        "Hindsight client %s < %s. HERMES_HINDSIGHT_AUTO_UPGRADE=1 set; "
+                        "running auto-upgrade now (will block ~30-120s).",
+                        installed, _MIN_CLIENT_VERSION,
+                    )
+                    import shutil
+                    import subprocess
+                    import sys
+                    uv_path = shutil.which("uv")
+                    if uv_path:
+                        try:
+                            subprocess.run(
+                                [uv_path, "pip", "install", "--python", sys.executable,
+                                 "--quiet", "--upgrade", f"hindsight-client>={_MIN_CLIENT_VERSION}"],
+                                check=True, timeout=120, capture_output=True,
+                            )
+                            logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
+                        except Exception as e:
+                            logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
+                                           e, _MIN_CLIENT_VERSION)
+                    else:
+                        logger.warning("uv not found. Run: pip install 'hindsight-client>=%s'", _MIN_CLIENT_VERSION)
                 else:
-                    logger.warning("uv not found. Run: pip install 'hindsight-client>=%s'", _MIN_CLIENT_VERSION)
+                    logger.warning(
+                        "Hindsight client %s < %s. Auto-upgrade disabled "
+                        "(set HERMES_HINDSIGHT_AUTO_UPGRADE=1 to enable). "
+                        "Run manually: uv pip install --upgrade 'hindsight-client>=%s'",
+                        installed, _MIN_CLIENT_VERSION, _MIN_CLIENT_VERSION,
+                    )
+                    self._version_check_failed = True
+                    return
         except Exception:
             pass  # packaging not available or other issue — proceed anyway
 
