@@ -40,6 +40,7 @@ Payment / credit exhaustion fallback:
   their OpenRouter balance but has Codex OAuth or another provider available.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -100,11 +101,97 @@ class _OpenAIProxy:
 OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
 from agent.credential_pool import load_pool
+from agent.retry_utils import jittered_backoff, _parse_retry_after
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
+
+# Cap for Retry-After header: beyond this we fall back to jittered_backoff.
+_RETRY_AFTER_MAX_SECONDS: float = 60.0
+
+
+def _rate_limit_delay(attempt: int, err: Exception) -> float:
+    """Compute sleep duration for a rate-limited retry.
+
+    Combines jittered exponential backoff with the provider's ``Retry-After``
+    hint.  The ``Retry-After`` value is honoured only when it is within the
+    :data:`_RETRY_AFTER_MAX_SECONDS` cap; beyond that we fall back to the
+    backoff value alone to prevent unbounded waits.
+
+    Args:
+        attempt: 1-based retry attempt number passed to :func:`jittered_backoff`.
+        err: The rate-limit exception; ``getattr(err, 'response', None)`` is
+            inspected for a ``Retry-After`` header.
+
+    Returns:
+        Seconds to sleep as a positive float.
+    """
+    delay = jittered_backoff(attempt)
+    ra = _parse_retry_after(getattr(err, "response", None))
+    if ra is not None and 0 < ra <= _RETRY_AFTER_MAX_SECONDS:
+        delay = max(delay, ra)
+    return delay
+
+
+def _retry_rate_limit_sync(client: Any, kwargs: dict, task: Any) -> Any:
+    """Attempt ``client.chat.completions.create`` once, sleeping on 429.
+
+    If the call raises a rate-limit error the function sleeps for a jittered
+    delay (honouring ``Retry-After`` when within the 60s cap) then retries
+    exactly once.
+
+    Args:
+        client: Provider client with a ``chat.completions.create`` method.
+        kwargs: Keyword arguments forwarded verbatim to ``create``.
+        task: Task label used for logging.
+
+    Returns:
+        The validated LLM response from the first successful call.
+
+    Raises:
+        Exception: Re-raises any error from the retry call.
+    """
+    attempt = 1
+    try:
+        return _validate_llm_response(client.chat.completions.create(**kwargs), task)
+    except Exception as err:
+        if not _is_rate_limit_error(err):
+            raise
+        delay = _rate_limit_delay(attempt, err)
+        logger.info(
+            "rate-limited on %s, sleeping %.2fs (attempt=%d, retry_after=%s)",
+            task or "call", delay, attempt,
+            _parse_retry_after(getattr(err, "response", None)),
+        )
+        time.sleep(delay)
+        return _validate_llm_response(client.chat.completions.create(**kwargs), task)
+
+
+async def _retry_rate_limit_async(client: Any, kwargs: dict, task: Any) -> Any:
+    """Async mirror of :func:`_retry_rate_limit_sync`.
+
+    Uses ``asyncio.sleep`` so the event loop is not blocked during the wait.
+    """
+    attempt = 1
+    try:
+        return _validate_llm_response(
+            await client.chat.completions.create(**kwargs), task
+        )
+    except Exception as err:
+        if not _is_rate_limit_error(err):
+            raise
+        delay = _rate_limit_delay(attempt, err)
+        logger.info(
+            "rate-limited on %s (async), sleeping %.2fs (attempt=%d, retry_after=%s)",
+            task or "call", delay, attempt,
+            _parse_retry_after(getattr(err, "response", None)),
+        )
+        await asyncio.sleep(delay)
+        return _validate_llm_response(
+            await client.chat.completions.create(**kwargs), task
+        )
 
 
 def _safe_isinstance(obj: Any, maybe_type: Any) -> bool:
@@ -4326,6 +4413,13 @@ def call_llm(
         if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
             recovery_err = first_err
             if _is_rate_limit_error(first_err):
+                _rl_delay = _rate_limit_delay(1, first_err)
+                logger.info(
+                    "rate-limited, sleeping %.2fs (attempt=1, retry_after=%s)",
+                    _rl_delay,
+                    _parse_retry_after(getattr(first_err, "response", None)),
+                )
+                time.sleep(_rl_delay)
                 try:
                     return _validate_llm_response(
                         client.chat.completions.create(**kwargs), task)
@@ -4675,6 +4769,13 @@ async def async_call_llm(
         if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
             recovery_err = first_err
             if _is_rate_limit_error(first_err):
+                _rl_delay = _rate_limit_delay(1, first_err)
+                logger.info(
+                    "rate-limited (async), sleeping %.2fs (attempt=1, retry_after=%s)",
+                    _rl_delay,
+                    _parse_retry_after(getattr(first_err, "response", None)),
+                )
+                await asyncio.sleep(_rl_delay)
                 try:
                     return _validate_llm_response(
                         await client.chat.completions.create(**kwargs), task)

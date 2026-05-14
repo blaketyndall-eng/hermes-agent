@@ -8,6 +8,8 @@ rate-limited provider concurrently.
 import random
 import threading
 import time
+from email.utils import parsedate_to_datetime
+from typing import Optional
 
 # Monotonic counter for jitter seed uniqueness within the same process.
 # Protected by a lock to avoid race conditions in concurrent retry paths
@@ -55,3 +57,52 @@ def jittered_backoff(
     jitter = rng.uniform(0, jitter_ratio * delay)
 
     return delay + jitter
+
+
+def _parse_retry_after(response: Optional[object]) -> Optional[float]:
+    """Parse the ``Retry-After`` header from an httpx/requests response object.
+
+    Supports both integer-seconds (``Retry-After: 30``) and HTTP-date formats
+    (``Retry-After: Wed, 21 Oct 2026 07:28:00 GMT``).
+
+    Args:
+        response: An httpx or requests response object with a ``.headers``
+            mapping, or ``None``.
+
+    Returns:
+        Float seconds to wait, or ``None`` if the header is absent or cannot
+        be parsed.  Returns 0.0 if the header value is "0".
+    """
+    if response is None:
+        return None
+
+    try:
+        headers = response.headers  # type: ignore[union-attr]
+    except AttributeError:
+        return None
+
+    # Headers may be a case-insensitive mapping (httpx/requests) or a plain
+    # dict.  Normalise by trying the canonical lowercase key first.
+    raw: Optional[str] = None
+    if hasattr(headers, "get"):
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+    if raw is None:
+        return None
+
+    raw = raw.strip()
+
+    # Try integer / float seconds first (most common provider format).
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+
+    # Try HTTP-date format (RFC 7231).
+    try:
+        dt = parsedate_to_datetime(raw)
+        delta = dt.timestamp() - time.time()
+        return max(0.0, delta)
+    except Exception:
+        pass
+
+    return None
