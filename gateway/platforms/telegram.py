@@ -8,6 +8,7 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -100,6 +101,78 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+
+# ---------------------------------------------------------------------------
+# Webhook secret verification — defense-in-depth
+# ---------------------------------------------------------------------------
+# PTB passes secret_token to its internal tornado WebhookHandler, but we add
+# a second independent check so that any PTB version quirk or misconfiguration
+# cannot silently revert to fail-open.  The logic is extracted to a plain
+# function so it can be tested without PTB installed.
+
+_WEBHOOK_SECRET_WARNED: bool = False
+
+
+def _check_webhook_secret(
+    header_value: Optional[str],
+    expected: Optional[str],
+) -> bool:
+    """Return True iff the supplied header is valid for the expected secret.
+
+    - If *expected* is falsy: always returns True (operator disabled secrets).
+    - Uses :func:`hmac.compare_digest` to prevent timing attacks.
+    """
+    if not expected:
+        return True
+    if not header_value:
+        return False
+    # Both sides must be the same type for compare_digest.
+    if isinstance(expected, str) and isinstance(header_value, str):
+        return hmac.compare_digest(header_value, expected)
+    return hmac.compare_digest(
+        header_value.encode(), expected.encode()
+    )
+
+
+async def _telegram_webhook_secret_middleware(request: Any, handler: Any) -> Any:
+    """aiohttp-style middleware that validates X-Telegram-Bot-Api-Secret-Token.
+
+    Intended for use with an aiohttp :class:`web.Application`.  Reads the
+    expected secret from the ``TELEGRAM_WEBHOOK_SECRET`` environment variable
+    at *request time* so live rotations are picked up without a restart.
+
+    Behaviour:
+    - No secret configured → log a one-time WARNING, pass through.
+    - Wrong / absent header → 401 Unauthorized.
+    - Correct header → delegate to *handler*.
+    """
+    global _WEBHOOK_SECRET_WARNED
+
+    expected = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip() or None
+    if not expected:
+        if not _WEBHOOK_SECRET_WARNED:
+            _WEBHOOK_SECRET_WARNED = True
+            logger.warning(
+                "TELEGRAM_WEBHOOK_SECRET is not set; webhook secret "
+                "validation is DISABLED.  Set the env var to enable "
+                "defense-in-depth verification of inbound Telegram updates."
+            )
+        return await handler(request)
+
+    header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if not _check_webhook_secret(header, expected):
+        logger.warning(
+            "Telegram webhook rejected: secret mismatch from %s",
+            getattr(request, "remote", "unknown"),
+        )
+        # Import lazily so this module loads without aiohttp installed.
+        from aiohttp import web as _aiohttp_web
+        return _aiohttp_web.Response(status=401, text="unauthorized")
+
+    return await handler(request)
+
+
+# ---------------------------------------------------------------------------
 
 
 def check_telegram_requirements() -> bool:
@@ -1341,6 +1414,48 @@ class TelegramAdapter(BasePlatformAdapter):
                 from urllib.parse import urlparse
                 webhook_path = urlparse(webhook_url).path or "/telegram"
 
+                # Defense-in-depth: build a custom WebhookHandler subclass
+                # that validates X-Telegram-Bot-Api-Secret-Token BEFORE PTB
+                # processes the request body.  PTB 22.x already does its own
+                # check when secret_token is supplied, but this second layer
+                # is independent of PTB internals and catches any version
+                # where PTB's validation is absent or misconfigured.
+                try:
+                    from telegram.ext._utils.webhookhandler import WebhookHandler as _PTBWebhookHandler
+
+                    _expected_secret = webhook_secret  # captured in closure
+
+                    class _SecureWebhookHandler(_PTBWebhookHandler):  # type: ignore[misc]
+                        """PTB WebhookHandler with an independent secret check."""
+
+                        async def post(self) -> None:  # type: ignore[override]
+                            header = self.request.headers.get(
+                                "X-Telegram-Bot-Api-Secret-Token"
+                            )
+                            if not _check_webhook_secret(header, _expected_secret):
+                                logger.warning(
+                                    "Telegram webhook rejected (defense-in-depth): "
+                                    "secret mismatch from %s",
+                                    self.request.remote_ip,
+                                )
+                                self.set_status(401)
+                                self.finish("unauthorized")
+                                return
+                            await super().post()
+
+                    _webhook_handler_kwargs: dict = {"webhook_handler_class": _SecureWebhookHandler}
+                except Exception:
+                    # PTB version doesn't expose WebhookHandler at the expected
+                    # path; fall back gracefully — PTB's own secret_token check
+                    # remains active.
+                    logger.debug(
+                        "[%s] Could not install custom WebhookHandler for "
+                        "defense-in-depth secret check (PTB internals may have "
+                        "changed); relying on PTB's built-in secret_token validation.",
+                        self.name,
+                    )
+                    _webhook_handler_kwargs = {}
+
                 await self._app.updater.start_webhook(
                     listen="0.0.0.0",
                     port=webhook_port,
@@ -1349,6 +1464,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     secret_token=webhook_secret,
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=True,
+                    **_webhook_handler_kwargs,
                 )
                 self._webhook_mode = True
                 logger.info(
