@@ -22,6 +22,14 @@ import pytest
 from tools import tool_output_limits as tol
 
 
+@pytest.fixture(autouse=True)
+def _clear_limits_cache():
+    """Ensure lru_cache is empty before every test so patches take effect."""
+    tol._invalidate_tool_output_limits_cache()
+    yield
+    tol._invalidate_tool_output_limits_cache()
+
+
 class TestDefaults:
     def test_defaults_match_previous_hardcoded_values(self):
         assert tol.DEFAULT_MAX_BYTES == 50_000
@@ -150,3 +158,22 @@ class TestIntegrationReadPagination:
         # Clamped to default MAX_LINES (2000).
         assert limit == tol.DEFAULT_MAX_LINES
         assert offset == 10
+
+
+class TestCaching:
+    """get_tool_output_limits must read config only once thanks to lru_cache."""
+
+    def test_get_tool_output_limits_cached(self):
+        """Calling get_tool_output_limits twice should invoke load_config once."""
+        with patch("hermes_cli.config.load_config", return_value={}) as mock_load:
+            tol.get_tool_output_limits()
+            tol.get_tool_output_limits()
+        mock_load.assert_called_once()
+
+    def test_invalidate_tool_output_limits_cache(self):
+        """After cache invalidation, the next call re-invokes load_config."""
+        with patch("hermes_cli.config.load_config", return_value={}) as mock_load:
+            tol.get_tool_output_limits()
+            tol._invalidate_tool_output_limits_cache()
+            tol.get_tool_output_limits()
+        assert mock_load.call_count == 2

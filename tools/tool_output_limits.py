@@ -31,6 +31,7 @@ fail because of a malformed config.
 
 from __future__ import annotations
 
+import functools
 from typing import Any, Dict
 
 # Hardcoded defaults — these match the pre-existing values, so adding
@@ -52,6 +53,7 @@ def _coerce_positive_int(value: Any, default: int) -> int:
     return iv
 
 
+@functools.lru_cache(maxsize=1)
 def get_tool_output_limits() -> Dict[str, int]:
     """Return resolved tool-output limits, reading ``tool_output`` from config.
 
@@ -75,6 +77,11 @@ def get_tool_output_limits() -> Dict[str, int]:
             section.get("max_line_length"), DEFAULT_MAX_LINE_LENGTH
         ),
     }
+
+
+def _invalidate_tool_output_limits_cache() -> None:
+    """Clear the lru_cache on get_tool_output_limits. Intended for tests."""
+    get_tool_output_limits.cache_clear()
 
 
 def get_max_bytes() -> int:
