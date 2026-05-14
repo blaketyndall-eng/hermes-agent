@@ -50,6 +50,63 @@ INSTALL_RE = re.compile(r"\b(npm|pnpm|yarn|pip|uv)\b.*\b(install|add)\b", re.I)
 SUCCESS_RE = re.compile(r"\b(success|passed|built|compiled|done|exit_code[\"']?\s*[:=]\s*0|verified|ok)\b", re.I)
 FILE_RE = re.compile(r"(?:/home/|~/?|\./|/mnt/)[\w./-]+\.(?:py|js|ts|tsx|jsx|css|html|md|json|yaml|yml|svg|sql|sh)")
 
+# ---------------------------------------------------------------------------
+# Combined scanner: 28 independent patterns pre-compiled once at module load
+# so analyze_messages() pays zero re.compile() cost per call.
+#
+# Several patterns share vocabulary (e.g. "playwright" appears in both
+# test_events and screenshot_events; "manifest.json" in plugin_events and
+# config_events; model sub-names in model_events and their own groups).
+# Because the original code ran each re.findall independently every match
+# position was counted by every matching pattern. A single alternation
+# finditer cannot replicate that — it assigns each position to exactly one
+# group. Therefore we use pre-compiled individual patterns and iterate them:
+# one compiled-regex object per pattern, zero compile overhead on hot path.
+#
+# Patterns that require conditional/AND logic (install_error_events,
+# install_success_events, restart_after_error_events, yaml_error_events,
+# tiny_patch_after_errors_events) and boolean-search patterns (port_conflict)
+# are intentionally kept as ad-hoc calls.
+# ---------------------------------------------------------------------------
+_SCAN_PATTERNS: Dict[str, str] = {
+    "traceback_events":         r"traceback|exception",
+    "log_read_events":          r"gateway\.log|errors\.log|agent\.log|/api/logs|\blogs\b",
+    "permission_denied_events": r"permission denied|eacces|operation not permitted",
+    "env_var_error_events":     r"missing .*env|api key|environment variable|not configured|unauthorized|auth",
+    "docker_conflict_events":   r"docker.*(name|container).*already|container name conflict|Conflict\. The container",
+    "frontend_activity_events": r"\.(css|svg|tsx|jsx)|frontend|tailwind|react",
+    "css_activity_events":      r"\.css|tailwind|style|className|visual",
+    "git_events":               r"\bgit\s+(?:commit|push|merge|rebase|status|diff)",
+    "context_events":           r"compress|context window|token|cache",
+    "gateway_events":           r"gateway|discord|telegram|slack|api_server",
+    "plugin_events":            r"plugin|dashboard-plugins|__HERMES_PLUGIN|manifest\.json",
+    "rollback_events":          r"rollback|checkpoint",
+    "docs_activity_events":     r"docs|documentation|docusaurus|README",
+    "model_events":             r"model|provider|openrouter|codex|gemini|claude|anthropic|openai|mistral|qwen|deepseek|llama|ollama|vllm|gguf",
+    "openrouter_events":        r"openrouter",
+    "codex_events":             r"codex",
+    "claude_events":            r"claude|anthropic",
+    "gemini_events":            r"gemini|google ai|google model",
+    "local_model_events":       r"ollama|llama\.cpp|gguf|vllm|local model|open[- ]weight|open weights",
+    "toolset_events":           r"toolset|enabled_toolsets|browser tool|terminal tool|file tool|web tool",
+    "config_events":            r"config\.ya?ml|\b[a-z0-9_-]+config\.(?:js|ts|json|ya?ml)|\.env(?:\b|\.)|manifest\.json|settings\.json|pyproject\.toml|package\.json",
+    "git_history_events":       r"\bgit\s+(?:rebase|merge|fetch|pull|push|tag|checkout)|merge conflict|conflict\s*\(|rebase --continue",
+    "test_events":              r"pytest|unittest|vitest|playwright|npm test|pnpm test|node --check|py_compile|tests? passed|\bOK\b",
+    "screenshot_events":        r"screenshot|playwright|vision_analyze|browser_vision|\.png|image data",
+    "release_events":           r"\bgit\s+tag|release|version bump|changelog|publish|pushed? tag",
+    "cache_events":             r"cache hit|prompt caching|cache_read",
+    # Inline re.findall calls that lived in the body of analyze_messages:
+    "_background_proc":         r"background\s*=\s*true",
+    "_skill_text":              r"\bskill",
+}
+
+# Each pattern compiled once at module load; (name, compiled_re) pairs for
+# the hot loop in analyze_messages.
+_COMPILED_SCAN_PATTERNS: List[Any] = [
+    (name, re.compile(pat, re.IGNORECASE))
+    for name, pat in _SCAN_PATTERNS.items()
+]
+
 TIER_NAMES = ["Copper", "Silver", "Gold", "Diamond", "Olympian"]
 
 
@@ -337,7 +394,6 @@ def analyze_messages(session_id: str, title: str, messages: List[Dict[str, Any]]
         files_touched.update(FILE_RE.findall(blob))
 
     full_text = "\n".join(full_text_parts)
-    lower = full_text.lower()
     terminal_calls = _count_tool(tool_sequence, "terminal")
     web_calls = _count_tool(tool_sequence, "web_search", "web_extract")
     web_extract_calls = _count_tool(tool_sequence, "web_extract")
@@ -347,14 +403,30 @@ def analyze_messages(session_id: str, title: str, messages: List[Dict[str, Any]]
     file_reads_searches = _count_tool(tool_sequence, "read_file", "search_files")
     file_tool_calls = _count_tool(tool_sequence, "read_file", "write_file", "patch", "search_files")
     delegate_calls = _count_tool(tool_sequence, "delegate_task")
-    process_calls = _count_tool(tool_sequence, "process") + len(re.findall(r"background\s*=\s*true", full_text, re.I))
     cron_calls = _count_tool(tool_sequence, "cronjob")
     image_vision_calls = _count_tool(tool_sequence, "image", "vision")
     tts_calls = _count_tool(tool_sequence, "tts", "text_to_speech")
-    skill_events = _count_tool(tool_sequence, "skill") + len(re.findall(r"\bskill", lower))
     skill_manage_events = _count_tool(tool_sequence, "skill_manage")
     memory_events = _count_tool(tool_sequence, "memory", "mnemosyne")
     memory_write_events = _count_tool(tool_sequence, "mnemosyne_remember", "memory")
+
+    # Pre-compiled patterns: one findall per pattern, zero re.compile() per call.
+    scan_counts: Dict[str, int] = {
+        name: len(compiled.findall(full_text))
+        for name, compiled in _COMPILED_SCAN_PATTERNS
+    }
+
+    # Fold inline-findall results back into their original metrics.
+    process_calls = _count_tool(tool_sequence, "process") + scan_counts.pop("_background_proc")
+    skill_events = _count_tool(tool_sequence, "skill") + scan_counts.pop("_skill_text")
+
+    # Conditional-logic patterns kept as separate calls (AND guards / error_count checks).
+    port_re_match = PORT_RE.search(full_text)
+    install_error_events = 1 if INSTALL_RE.search(full_text) and ERROR_RE.search(full_text) else 0
+    install_success_events = 1 if INSTALL_RE.search(full_text) and SUCCESS_RE.search(full_text) else 0
+    restart_after_error_events = 1 if error_count and re.search(r"\brestart|reload|kill|start\b", full_text, re.I) else 0
+    yaml_error_events = len(re.findall(r"yaml|yml|colon|parse error", full_text, re.I)) if ERROR_RE.search(full_text) else 0
+    tiny_patch_after_errors_events = 1 if error_count >= 5 and re.search(r"one character|single character|typo", full_text, re.I) else 0
 
     return {
         "session_id": session_id,
@@ -382,39 +454,39 @@ def analyze_messages(session_id: str, title: str, messages: List[Dict[str, Any]]
         "skill_manage_events": skill_manage_events,
         "memory_events": memory_events,
         "memory_write_events": memory_write_events,
-        "port_conflict": bool(PORT_RE.search(full_text)),
-        "port_conflict_events": 1 if PORT_RE.search(full_text) else 0,
-        "traceback_events": len(re.findall(r"traceback|exception", full_text, re.I)),
-        "log_read_events": len(re.findall(r"gateway\.log|errors\.log|agent\.log|/api/logs|\blogs\b", full_text, re.I)),
-        "permission_denied_events": len(re.findall(r"permission denied|eacces|operation not permitted", full_text, re.I)),
-        "install_error_events": 1 if INSTALL_RE.search(full_text) and ERROR_RE.search(full_text) else 0,
-        "install_success_events": 1 if INSTALL_RE.search(full_text) and SUCCESS_RE.search(full_text) else 0,
-        "restart_after_error_events": 1 if error_count and re.search(r"\brestart|reload|kill|start\b", full_text, re.I) else 0,
-        "env_var_error_events": len(re.findall(r"missing .*env|api key|environment variable|not configured|unauthorized|auth", full_text, re.I)),
-        "yaml_error_events": len(re.findall(r"yaml|yml|colon|parse error", full_text, re.I)) if ERROR_RE.search(full_text) else 0,
-        "docker_conflict_events": len(re.findall(r"docker.*(name|container).*already|container name conflict|Conflict\. The container", full_text, re.I)),
-        "frontend_activity_events": len(re.findall(r"\.(css|svg|tsx|jsx)|frontend|tailwind|react", full_text, re.I)),
-        "css_activity_events": len(re.findall(r"\.css|tailwind|style|className|visual", full_text, re.I)),
-        "git_events": len(re.findall(r"\bgit\s+(commit|push|merge|rebase|status|diff)", full_text, re.I)),
-        "tiny_patch_after_errors_events": 1 if error_count >= 5 and re.search(r"one character|single character|typo", full_text, re.I) else 0,
-        "context_events": len(re.findall(r"compress|context window|token|cache", full_text, re.I)),
-        "gateway_events": len(re.findall(r"gateway|discord|telegram|slack|api_server", full_text, re.I)),
-        "plugin_events": len(re.findall(r"plugin|dashboard-plugins|__HERMES_PLUGIN|manifest\.json", full_text, re.I)),
-        "rollback_events": len(re.findall(r"rollback|checkpoint", full_text, re.I)),
-        "docs_activity_events": len(re.findall(r"docs|documentation|docusaurus|README", full_text, re.I)),
-        "model_events": len(re.findall(r"model|provider|openrouter|codex|gemini|claude|anthropic|openai|mistral|qwen|deepseek|llama|ollama|vllm|gguf", full_text, re.I)),
-        "openrouter_events": len(re.findall(r"openrouter", full_text, re.I)),
-        "codex_events": len(re.findall(r"codex", full_text, re.I)),
-        "claude_events": len(re.findall(r"claude|anthropic", full_text, re.I)),
-        "gemini_events": len(re.findall(r"gemini|google ai|google model", full_text, re.I)),
-        "local_model_events": len(re.findall(r"ollama|llama\.cpp|gguf|vllm|local model|open[- ]weight|open weights", full_text, re.I)),
-        "toolset_events": len(re.findall(r"toolset|enabled_toolsets|browser tool|terminal tool|file tool|web tool", full_text, re.I)),
-        "config_events": len(re.findall(r"config\.ya?ml|\b[a-z0-9_-]+config\.(?:js|ts|json|ya?ml)|\.env(?:\b|\.)|manifest\.json|settings\.json|pyproject\.toml|package\.json", full_text, re.I)),
-        "git_history_events": len(re.findall(r"\bgit\s+(rebase|merge|fetch|pull|push|tag|checkout)|merge conflict|conflict\s*\(|rebase --continue", full_text, re.I)),
-        "test_events": len(re.findall(r"pytest|unittest|vitest|playwright|npm test|pnpm test|node --check|py_compile|tests? passed|\bOK\b", full_text, re.I)),
-        "screenshot_events": len(re.findall(r"screenshot|playwright|vision_analyze|browser_vision|\.png|image data", full_text, re.I)),
-        "release_events": len(re.findall(r"\bgit\s+tag|release|version bump|changelog|publish|pushed? tag", full_text, re.I)),
-        "cache_events": len(re.findall(r"cache hit|prompt caching|cache_read", full_text, re.I)),
+        "port_conflict": bool(port_re_match),
+        "port_conflict_events": 1 if port_re_match else 0,
+        "traceback_events": scan_counts["traceback_events"],
+        "log_read_events": scan_counts["log_read_events"],
+        "permission_denied_events": scan_counts["permission_denied_events"],
+        "install_error_events": install_error_events,
+        "install_success_events": install_success_events,
+        "restart_after_error_events": restart_after_error_events,
+        "env_var_error_events": scan_counts["env_var_error_events"],
+        "yaml_error_events": yaml_error_events,
+        "docker_conflict_events": scan_counts["docker_conflict_events"],
+        "frontend_activity_events": scan_counts["frontend_activity_events"],
+        "css_activity_events": scan_counts["css_activity_events"],
+        "git_events": scan_counts["git_events"],
+        "tiny_patch_after_errors_events": tiny_patch_after_errors_events,
+        "context_events": scan_counts["context_events"],
+        "gateway_events": scan_counts["gateway_events"],
+        "plugin_events": scan_counts["plugin_events"],
+        "rollback_events": scan_counts["rollback_events"],
+        "docs_activity_events": scan_counts["docs_activity_events"],
+        "model_events": scan_counts["model_events"],
+        "openrouter_events": scan_counts["openrouter_events"],
+        "codex_events": scan_counts["codex_events"],
+        "claude_events": scan_counts["claude_events"],
+        "gemini_events": scan_counts["gemini_events"],
+        "local_model_events": scan_counts["local_model_events"],
+        "toolset_events": scan_counts["toolset_events"],
+        "config_events": scan_counts["config_events"],
+        "git_history_events": scan_counts["git_history_events"],
+        "test_events": scan_counts["test_events"],
+        "screenshot_events": scan_counts["screenshot_events"],
+        "release_events": scan_counts["release_events"],
+        "cache_events": scan_counts["cache_events"],
         "model_names": set(),
     }
 
