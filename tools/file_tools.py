@@ -156,21 +156,45 @@ _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
-    """Return an error message if the path targets a sensitive system location."""
-    try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
-    except (OSError, ValueError):
-        resolved = filepath
-    normalized = os.path.normpath(os.path.expanduser(filepath))
+    """Return an error message if the path targets a sensitive system location.
+
+    Canonicalises the path via ``Path.resolve(strict=False)`` **before**
+    comparing against sensitive prefixes so that:
+    * symlinks pointing into sensitive directories are caught, and
+    * ``..`` components that traverse into sensitive directories are caught.
+
+    ``strict=False`` means non-existent paths (e.g. a write target that has
+    not been created yet) are handled without raising ``FileNotFoundError``.
+    Symlink loops and other OS-level resolution errors cause the path to be
+    treated as sensitive (i.e. rejected) rather than silently allowed.
+    """
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
-    for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix) or normalized.startswith(prefix):
-            return _err
-    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
+    try:
+        resolved = Path(filepath).resolve(strict=False)
+    except (RuntimeError, OSError):
+        # Unresolvable path (e.g. symlink loop) — reject to be safe.
         return _err
+
+    for prefix in _SENSITIVE_PATH_PREFIXES:
+        try:
+            prefix_resolved = Path(prefix).resolve(strict=False)
+        except (RuntimeError, OSError):
+            prefix_resolved = Path(prefix)
+        if resolved.is_relative_to(prefix_resolved):
+            return _err
+
+    # Resolve exact-match paths too.
+    for exact in _SENSITIVE_EXACT_PATHS:
+        try:
+            exact_resolved = Path(exact).resolve(strict=False)
+        except (RuntimeError, OSError):
+            exact_resolved = Path(exact)
+        if resolved == exact_resolved:
+            return _err
+
     return None
 
 
