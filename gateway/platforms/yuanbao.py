@@ -668,6 +668,11 @@ class SignManager:
     # disconnect() clears this dict to prevent stale locks across reconnects.
     _locks: dict[str, asyncio.Lock] = {}
 
+    # Shared httpx.AsyncClient — created lazily on first fetch(), reused across
+    # retry iterations and across calls.  Closed via close_client() which is
+    # invoked from the disconnect() path alongside clear_locks().
+    _httpx_client: Optional[Any] = None
+
     # -- Internal helpers --------------------------------------------------
 
     @classmethod
@@ -710,6 +715,21 @@ class SignManager:
         cls._locks.clear()
 
     @classmethod
+    async def close_client(cls) -> None:
+        """Close the shared httpx.AsyncClient if one exists.
+
+        Called from the platform disconnect() path to release the connection
+        pool and SSL context promptly.
+        """
+        if cls._httpx_client is not None:
+            try:
+                await cls._httpx_client.aclose()
+            except Exception:  # pragma: no cover - defensive cleanup
+                pass
+            finally:
+                cls._httpx_client = None
+
+    @classmethod
     def purge_expired(cls) -> int:
         """Remove all expired entries from the token cache.
 
@@ -738,67 +758,69 @@ class SignManager:
     ) -> dict[str, Any]:
         """Send sign-ticket HTTP request with auto-retry (up to MAX_RETRIES times)."""
         url = f"{api_domain.rstrip('/')}{cls.TOKEN_PATH}"
-        async with httpx.AsyncClient(timeout=cls.HTTP_TIMEOUT_S) as client:
-            for attempt in range(cls.MAX_RETRIES + 1):
-                nonce = secrets.token_hex(16)
-                timestamp = cls.build_timestamp()
-                signature = cls.compute_signature(nonce, timestamp, app_key, app_secret)
+        if cls._httpx_client is None or cls._httpx_client.is_closed:
+            cls._httpx_client = httpx.AsyncClient(timeout=cls.HTTP_TIMEOUT_S)
+        client = cls._httpx_client
+        for attempt in range(cls.MAX_RETRIES + 1):
+            nonce = secrets.token_hex(16)
+            timestamp = cls.build_timestamp()
+            signature = cls.compute_signature(nonce, timestamp, app_key, app_secret)
 
-                payload = {
-                    "app_key": app_key,
-                    "nonce": nonce,
-                    "signature": signature,
-                    "timestamp": timestamp,
-                }
+            payload = {
+                "app_key": app_key,
+                "nonce": nonce,
+                "signature": signature,
+                "timestamp": timestamp,
+            }
 
-                headers = {
-                    "Content-Type": "application/json",
-                    "X-AppVersion": _APP_VERSION,
-                    "X-OperationSystem": _OPERATION_SYSTEM,
-                    "X-Instance-Id": _YUANBAO_INSTANCE_ID,
-                    "X-Bot-Version": _BOT_VERSION,
-                }
-                if route_env:
-                    headers["X-Route-Env"] = route_env
+            headers = {
+                "Content-Type": "application/json",
+                "X-AppVersion": _APP_VERSION,
+                "X-OperationSystem": _OPERATION_SYSTEM,
+                "X-Instance-Id": _YUANBAO_INSTANCE_ID,
+                "X-Bot-Version": _BOT_VERSION,
+            }
+            if route_env:
+                headers["X-Route-Env"] = route_env
 
-                logger.info(
-                    "Sign token request: url=%s%s",
-                    url,
-                    f" (retry {attempt}/{cls.MAX_RETRIES})" if attempt > 0 else "",
+            logger.info(
+                "Sign token request: url=%s%s",
+                url,
+                f" (retry {attempt}/{cls.MAX_RETRIES})" if attempt > 0 else "",
+            )
+
+            response = await client.post(url, json=payload, headers=headers)
+
+            if response.status_code != 200:
+                body = response.text
+                raise RuntimeError(f"Sign token API returned {response.status_code}: {body[:200]}")
+
+            try:
+                result_data: dict[str, Any] = response.json()
+            except Exception as exc:
+                raise ValueError(f"Sign token response parse error: {exc}") from exc
+
+            code = result_data.get("code")
+            if code == 0:
+                data = result_data.get("data")
+                if not isinstance(data, dict):
+                    raise ValueError(f"Sign token response missing 'data' field: {result_data}")
+                logger.info("Sign token success: bot_id=%s", data.get("bot_id"))
+                return data
+
+            if code == cls.RETRYABLE_CODE and attempt < cls.MAX_RETRIES:
+                logger.warning(
+                    "Sign token retryable: code=%s, retrying in %ss (attempt=%d/%d)",
+                    code,
+                    cls.RETRY_DELAY_S,
+                    attempt + 1,
+                    cls.MAX_RETRIES,
                 )
+                await asyncio.sleep(cls.RETRY_DELAY_S)
+                continue
 
-                response = await client.post(url, json=payload, headers=headers)
-
-                if response.status_code != 200:
-                    body = response.text
-                    raise RuntimeError(f"Sign token API returned {response.status_code}: {body[:200]}")
-
-                try:
-                    result_data: dict[str, Any] = response.json()
-                except Exception as exc:
-                    raise ValueError(f"Sign token response parse error: {exc}") from exc
-
-                code = result_data.get("code")
-                if code == 0:
-                    data = result_data.get("data")
-                    if not isinstance(data, dict):
-                        raise ValueError(f"Sign token response missing 'data' field: {result_data}")
-                    logger.info("Sign token success: bot_id=%s", data.get("bot_id"))
-                    return data
-
-                if code == cls.RETRYABLE_CODE and attempt < cls.MAX_RETRIES:
-                    logger.warning(
-                        "Sign token retryable: code=%s, retrying in %ss (attempt=%d/%d)",
-                        code,
-                        cls.RETRY_DELAY_S,
-                        attempt + 1,
-                        cls.MAX_RETRIES,
-                    )
-                    await asyncio.sleep(cls.RETRY_DELAY_S)
-                    continue
-
-                msg = result_data.get("msg", "")
-                raise RuntimeError(f"Sign token error: code={code}, msg={msg}")
+            msg = result_data.get("msg", "")
+            raise RuntimeError(f"Sign token error: code={code}, msg={msg}")
 
         raise RuntimeError("Sign token failed: max retries exceeded")
 
@@ -2796,8 +2818,10 @@ class ConnectionManager:
                 fut.set_exception(disc_exc)
         self._pending_acks.clear()
 
-        # Clear refresh locks to avoid stale locks from a previous event loop
+        # Clear refresh locks and close the shared httpx client to avoid stale
+        # state across reconnects.
         SignManager.clear_locks()
+        await SignManager.close_client()
 
         await self._cleanup_ws()
 

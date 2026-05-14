@@ -589,6 +589,23 @@ class DiscordAdapter(BasePlatformAdapter):
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
+        # Shared aiohttp session for image/animation/document fetches.
+        # Lazy-initialised on first use; closed in disconnect().
+        self._image_session: Optional[Any] = None
+
+    async def _get_image_session(self):
+        """Return the shared aiohttp.ClientSession for image/animation/document downloads.
+
+        Lazy-initialised on first call so the event loop is guaranteed to be
+        running.  Closed in :meth:`disconnect`.
+        """
+        if self._image_session is None or getattr(self._image_session, "closed", False):
+            import aiohttp as _aiohttp
+            from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+            _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
+            _sess_kw, _ = proxy_kwargs_for_aiohttp(_proxy)
+            self._image_session = _aiohttp.ClientSession(**_sess_kw)
+        return self._image_session
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -871,6 +888,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self.leave_voice_channel(guild_id)
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
+
+        if self._image_session is not None:
+            try:
+                await self._image_session.close()
+            except Exception:  # pragma: no cover - defensive cleanup
+                pass
+            self._image_session = None
 
         if self._client:
             try:
@@ -1691,7 +1715,6 @@ class DiscordAdapter(BasePlatformAdapter):
 
             files: List[Any] = []
             captions: List[str] = []
-            aiohttp_session = None
             try:
                 for image_url, alt_text in chunk:
                     if alt_text:
@@ -1709,12 +1732,11 @@ class DiscordAdapter(BasePlatformAdapter):
                         # Download to BytesIO so it renders inline
                         try:
                             import aiohttp as _aiohttp
-                            from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+                            from gateway.platforms.base import proxy_kwargs_for_aiohttp, resolve_proxy_url  # noqa: F401
                             _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
-                            _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
-                            if aiohttp_session is None:
-                                aiohttp_session = _aiohttp.ClientSession(**_sess_kw)
-                            async with aiohttp_session.get(
+                            _, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+                            _session = await self._get_image_session()
+                            async with _session.get(
                                 image_url, timeout=_aiohttp.ClientTimeout(total=30), **_req_kw,
                             ) as resp:
                                 if resp.status != 200:
@@ -1762,12 +1784,6 @@ class DiscordAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
                 await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
-            finally:
-                if aiohttp_session is not None:
-                    try:
-                        await aiohttp_session.close()
-                    except Exception:
-                        pass
 
     async def play_tts(
         self,
@@ -2537,38 +2553,38 @@ class DiscordAdapter(BasePlatformAdapter):
             from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
             _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
             _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
-            async with aiohttp.ClientSession(**_sess_kw) as session:
-                async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=30), **_req_kw) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"Failed to download image: HTTP {resp.status}")
+            _session = await self._get_image_session()
+            async with _session.get(image_url, timeout=aiohttp.ClientTimeout(total=30), **_req_kw) as resp:
+                if resp.status != 200:
+                    raise Exception(f"Failed to download image: HTTP {resp.status}")
 
-                    image_data = await resp.read()
+                image_data = await resp.read()
 
-                    # Determine filename from URL or content type
-                    content_type = resp.headers.get("content-type", "image/png")
-                    ext = "png"
-                    if "jpeg" in content_type or "jpg" in content_type:
-                        ext = "jpg"
-                    elif "gif" in content_type:
-                        ext = "gif"
-                    elif "webp" in content_type:
-                        ext = "webp"
+                # Determine filename from URL or content type
+                content_type = resp.headers.get("content-type", "image/png")
+                ext = "png"
+                if "jpeg" in content_type or "jpg" in content_type:
+                    ext = "jpg"
+                elif "gif" in content_type:
+                    ext = "gif"
+                elif "webp" in content_type:
+                    ext = "webp"
 
-                    import io
-                    file = discord.File(io.BytesIO(image_data), filename=f"image.{ext}")
+                import io
+                file = discord.File(io.BytesIO(image_data), filename=f"image.{ext}")
 
-                    if self._is_forum_parent(channel):
-                        return await self._forum_post_file(
-                            channel,
-                            content=(caption or "").strip(),
-                            file=file,
-                        )
-
-                    msg = await channel.send(
-                        content=caption if caption else None,
+                if self._is_forum_parent(channel):
+                    return await self._forum_post_file(
+                        channel,
+                        content=(caption or "").strip(),
                         file=file,
                     )
-                    return SendResult(success=True, message_id=str(msg.id))
+
+                msg = await channel.send(
+                    content=caption if caption else None,
+                    file=file,
+                )
+                return SendResult(success=True, message_id=str(msg.id))
 
         except ImportError:
             logger.warning(
@@ -2616,28 +2632,28 @@ class DiscordAdapter(BasePlatformAdapter):
             from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
             _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
             _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
-            async with aiohttp.ClientSession(**_sess_kw) as session:
-                async with session.get(animation_url, timeout=aiohttp.ClientTimeout(total=30), **_req_kw) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"Failed to download animation: HTTP {resp.status}")
+            _session = await self._get_image_session()
+            async with _session.get(animation_url, timeout=aiohttp.ClientTimeout(total=30), **_req_kw) as resp:
+                if resp.status != 200:
+                    raise Exception(f"Failed to download animation: HTTP {resp.status}")
 
-                    animation_data = await resp.read()
+                animation_data = await resp.read()
 
-                    import io
-                    file = discord.File(io.BytesIO(animation_data), filename="animation.gif")
+                import io
+                file = discord.File(io.BytesIO(animation_data), filename="animation.gif")
 
-                    if self._is_forum_parent(channel):
-                        return await self._forum_post_file(
-                            channel,
-                            content=(caption or "").strip(),
-                            file=file,
-                        )
-
-                    msg = await channel.send(
-                        content=caption if caption else None,
+                if self._is_forum_parent(channel):
+                    return await self._forum_post_file(
+                        channel,
+                        content=(caption or "").strip(),
                         file=file,
                     )
-                    return SendResult(success=True, message_id=str(msg.id))
+
+                msg = await channel.send(
+                    content=caption if caption else None,
+                    file=file,
+                )
+                return SendResult(success=True, message_id=str(msg.id))
 
         except ImportError:
             logger.warning(
@@ -4129,15 +4145,15 @@ class DiscordAdapter(BasePlatformAdapter):
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
-        async with aiohttp.ClientSession(**_sess_kw) as session:
-            async with session.get(
-                att.url,
-                timeout=aiohttp.ClientTimeout(total=30),
-                **_req_kw,
-            ) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}")
-                return await resp.read()
+        _session = await self._get_image_session()
+        async with _session.get(
+            att.url,
+            timeout=aiohttp.ClientTimeout(total=30),
+            **_req_kw,
+        ) as resp:
+            if resp.status != 200:
+                raise Exception(f"HTTP {resp.status}")
+            return await resp.read()
 
     async def _handle_message(self, message: DiscordMessage) -> None:
         """Handle incoming Discord messages."""
