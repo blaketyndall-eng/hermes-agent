@@ -1027,3 +1027,40 @@ class TestPipelineOOPRegistration:
         pipeline = InboundPipeline().use(MwA()).use(MwC())
         pipeline.use_after("a", MwB())
         assert pipeline.middleware_names == ["a", "b", "c"]
+
+
+# ============================================================
+# W2-T15: Per-frame log level regression tests
+# ============================================================
+
+class TestPerFrameLogLevels:
+    """Ensure per-frame WS log calls are emitted at DEBUG, not INFO."""
+
+    @pytest.mark.asyncio
+    async def test_yuanbao_push_logged_at_debug_not_info(self, caplog):
+        """DecodeMiddleware logs 'Push decoded' at DEBUG, not INFO."""
+        import logging
+        push_data = make_json_push(from_account="alice", text="hello")
+        ctx = make_ctx(conn_data=push_data)
+        next_fn = AsyncMock()
+
+        with caplog.at_level(logging.DEBUG, logger="gateway.platforms.yuanbao"):
+            await DecodeMiddleware()(ctx, next_fn)
+
+        push_decoded_records = [
+            r for r in caplog.records
+            if "Push decoded" in r.message
+        ]
+        assert push_decoded_records, "Expected at least one 'Push decoded' log record"
+        for record in push_decoded_records:
+            assert record.levelno == logging.DEBUG, (
+                "Expected DEBUG but got %s for: %s" % (record.levelname, record.message)
+            )
+        # Confirm none slipped through at INFO
+        info_push_decoded = [
+            r for r in caplog.records
+            if "Push decoded" in r.message and r.levelno == logging.INFO
+        ]
+        assert not info_push_decoded, (
+            "Found INFO-level 'Push decoded' records: %s" % [r.message for r in info_push_decoded]
+        )

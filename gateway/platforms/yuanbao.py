@@ -1196,7 +1196,7 @@ class DecodeMiddleware(InboundMiddleware):
         for data in data_list:
             push, via = self._decode_single(ctx.adapter, data)
             if not push:
-                logger.info(
+                logger.debug(
                 "[%s] Push decoded but no valid message. raw hex(first64)=%s",
                     ctx.adapter.name, data.hex()[:128] if data else "(empty)",
                 )
@@ -1206,7 +1206,7 @@ class DecodeMiddleware(InboundMiddleware):
                 # First valid push becomes the base
                 merged_push = push
                 decoded_via = via
-                logger.info(
+                logger.debug(
                 "[%s] Frame decoded (via=%s): len=%d",
                     ctx.adapter.name, via, len(data),
                 )
@@ -1216,7 +1216,7 @@ class DecodeMiddleware(InboundMiddleware):
                 if extra_body:
                     _sep = {"msg_type": "TIMTextElem", "msg_content": {"text": "\n"}}
                     merged_push["msg_body"] = merged_push.get("msg_body", []) + [_sep] + extra_body
-                    logger.info(
+                    logger.debug(
                         "[%s] Merged %d extra msg_body elements from aggregated push",
                         ctx.adapter.name, len(extra_body),
                     )
@@ -1227,7 +1227,7 @@ class DecodeMiddleware(InboundMiddleware):
         ctx.push = merged_push
         ctx.decoded_via = decoded_via
 
-        logger.info(
+        logger.debug(
             "[%s] Push decoded (via=%s): from=%s group=%s msg_id=%s msg_types=%s",
             ctx.adapter.name, ctx.decoded_via,
             ctx.push.get("from_account", ""),
@@ -2082,7 +2082,7 @@ class GroupAtGuardMiddleware(InboundMiddleware):
                 adapter, ctx.source, ctx.sender_nickname or ctx.from_account, ctx.raw_text,
                 msg_id=ctx.msg_id or None,
             )
-            logger.info(
+            logger.debug(
                 "[%s] Group message observed (no @bot): chat=%s from=%s",
                 adapter.name, ctx.chat_id, ctx.from_account,
             )
@@ -2553,7 +2553,7 @@ class DispatchMiddleware(InboundMiddleware):
             is_new = _sk not in adapter._group_queues
             queue = adapter._group_queues.setdefault(_sk, asyncio.Queue())
             queue.put_nowait(_dispatch_inbound_event)
-            logger.info(
+            logger.debug(
                 "[%s] Group message enqueued (qsize=%d) for %s",
                 adapter.name, queue.qsize(), (_sk or "")[:50],
             )
@@ -3042,7 +3042,7 @@ class ConnectionManager:
 
         # Server-initiated Push
         if cmd_type == CMD_TYPE["Push"]:
-            logger.info("[%s] Push received: cmd=%s msg_id=%s data_len=%d", adapter.name, cmd, msg_id, len(data))
+            logger.debug("[%s] Push received: cmd=%s msg_id=%s data_len=%d", adapter.name, cmd, msg_id, len(data))
             if need_ack and self._ws is not None:
                 try:
                     ack_bytes = encode_push_ack(head)
@@ -3062,7 +3062,7 @@ class ConnectionManager:
 
             # Genuine inbound message — dispatch to AI
             if data:
-                logger.info(
+                logger.debug(
                     "[%s] WS received inbound push, decoding and dispatching: cmd=%s, data_len=%d",
                     adapter.name, cmd, len(data),
                 )
@@ -3151,7 +3151,7 @@ class ConnectionManager:
             return
 
         adapter = self._adapter
-        logger.info(
+        logger.debug(
             "[%s] Debounce flush: key=%s, aggregated %d frames",
             adapter.name, key, len(data_list),
         )
