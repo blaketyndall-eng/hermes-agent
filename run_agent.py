@@ -11189,6 +11189,26 @@ class AIAgent:
         )
         return compressed, new_system_prompt
 
+    async def _async_compress_context(
+        self,
+        messages: list,
+        system_message: str,
+        *,
+        approx_tokens: int = None,
+        task_id: str = "default",
+        focus_topic: str = None,
+    ) -> tuple:
+        ctx = contextvars.copy_context()
+        return await asyncio.to_thread(
+            ctx.run,
+            self._compress_context,
+            messages,
+            system_message,
+            approx_tokens=approx_tokens,
+            task_id=task_id,
+            focus_topic=focus_topic,
+        )
+
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""
         if decision.should_halt and self._tool_guardrail_halt_decision is None:
