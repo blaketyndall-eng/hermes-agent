@@ -16318,6 +16318,39 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     logger.info("Cron ticker stopped")
 
 
+async def _wait_for_pid_exit_async(pid: int, total_seconds: float = 10.0, interval: float = 0.5) -> bool:
+    """Async-safe PID wait: yields to the event loop between polls.
+
+    Returns True if the process exited within *total_seconds*, False if it
+    is still alive after the deadline.  Uses the same ``_pid_exists`` helper
+    as the surrounding gateway code so Windows handle-based checks are
+    respected automatically.
+    """
+    from gateway.status import _pid_exists
+
+    deadline = time.monotonic() + total_seconds
+    while time.monotonic() < deadline:
+        if not _pid_exists(pid):
+            return True
+        await asyncio.sleep(interval)
+    return False
+
+
+def _wait_for_pid_exit_sync(pid: int, total_seconds: float = 10.0, interval: float = 0.5) -> bool:
+    """Sync PID wait for use outside an asyncio event loop.
+
+    Returns True if the process exited within *total_seconds*, False otherwise.
+    """
+    from gateway.status import _pid_exists
+
+    deadline = time.monotonic() + total_seconds
+    while time.monotonic() < deadline:
+        if not _pid_exists(pid):
+            return True
+        time.sleep(interval)
+    return False
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -16383,12 +16416,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             # Wait up to 10 seconds for the old process to exit.
             # ``os.kill(pid, 0)`` on Windows is NOT a no-op — use the
             # handle-based existence check instead.
-            from gateway.status import _pid_exists
-            for _ in range(20):
-                if not _pid_exists(existing_pid):
-                    break  # Process is gone
-                time.sleep(0.5)
-            else:
+            # _wait_for_pid_exit_async yields to the event loop between polls
+            # so the /restart slash-command path never blocks the gateway loop.
+            exited = await _wait_for_pid_exit_async(existing_pid, total_seconds=10.0, interval=0.5)
+            if not exited:
                 # Still alive after 10s — force kill
                 logger.warning(
                     "Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.",
@@ -16396,7 +16427,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 )
                 try:
                     terminate_pid(existing_pid, force=True)
-                    time.sleep(0.5)
+                    await asyncio.sleep(0.5)
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
             remove_pid_file()
